@@ -11232,7 +11232,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.1.0";
+const GENERATOR = "dsgraph@0.2.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
