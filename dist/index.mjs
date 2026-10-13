@@ -9458,7 +9458,7 @@ function serializeForExpression(v) {
 	const color = looseColor(v);
 	return color ? colorToCss(color) : void 0;
 }
-/** `rgba(<color>, <alpha>)`: a color with a new alpha, as Tokens Studio writes it. */
+/** `rgba(<color>, <alpha>)`: a color with a new alpha, as token-set files write it. */
 function colorWithAlpha(text) {
 	const m = /^rgba?\((.+),\s*(\d*\.?\d+%?)\s*\)$/is.exec(text.trim());
 	if (!m) return void 0;
@@ -9475,7 +9475,7 @@ function colorWithAlpha(text) {
 /**
 * Evaluates expression text (references already substituted) into a DTCG value: a color, a
 * dimension `{ value, unit }` or a number. Undefined when the text is neither.
-* A unitless result of a dimension takes `defaultUnit` (Tokens Studio: px).
+* A unitless result of a dimension takes `defaultUnit` (token sets: px).
 */
 function evaluateExpression(text, hint, defaultUnit) {
 	if (hint === "color" || /^(rgba?|hsla?|#)/i.test(text.trim())) {
@@ -9512,7 +9512,8 @@ const toP3 = conv("p3");
 const toOklch = conv("oklch");
 const clamp01 = (n) => Math.max(0, Math.min(1, n));
 /**
-* Applies a Tokens Studio color modifier (the formulas of `@tokens-studio/sd-transforms`) and
+* Applies a token-set color modifier (lighten, darken, mix, alpha, with the formulas the common token
+* build tools use) and
 * returns a DTCG color object in the modifier's space.
 */
 function modifyColor(base, mod) {
@@ -11055,7 +11056,7 @@ function strip(tree, found, path = []) {
 }
 /**
 * Modes written per token in `$extensions.mode` (`{ "light": …, "dark": … }`), as Figma variable
-* exports and Terrazzo write them, become modifiers. Tokens that share the same mode names share a
+* exports and some build tools write them, become modifiers. Tokens that share the same mode names share a
 * modifier; it is called `theme` for light and dark, otherwise after the top-level group (a Figma
 * collection) its tokens live in. Systems that already have modifiers are left as they are.
 */
@@ -11141,6 +11142,65 @@ function expandModes(system, diag) {
 	}
 	return out;
 }
+const stem = (file) => file.slice(file.lastIndexOf("/") + 1).replace(/\.(tokens\.json|tokens|json5?)$/i, "");
+const dirOf = (file) => file.includes("/") ? file.slice(0, file.lastIndexOf("/")) : "";
+function tokenIds$1(tree, path = [], out = /* @__PURE__ */ new Set()) {
+	if (!isPlainObject(tree)) return out;
+	if (Object.hasOwn(tree, "$value")) out.add(path.join("."));
+	else for (const [k, v] of Object.entries(tree)) if (!k.startsWith("$")) tokenIds$1(v, [...path, k], out);
+	return out;
+}
+/**
+* Files side by side that define the same tokens are modes of one collection, as Figma exports
+* write them (`Colors/Light.tokens.json`, `Colors/Dark.tokens.json`): one modifier per folder,
+* a context per file. Undefined when no folder looks like that.
+*/
+function systemFromModeFiles(docs, diag) {
+	const byDir = /* @__PURE__ */ new Map();
+	for (const d of docs) byDir.set(dirOf(d.file), [...byDir.get(dirOf(d.file)) ?? [], d]);
+	const groups = [];
+	for (const [dir, list] of byDir) {
+		if (list.length < 2) continue;
+		const ids = list.map((d) => tokenIds$1(d.tree));
+		const first = ids[0];
+		if (first.size === 0) continue;
+		if (ids.every((s) => {
+			let common = 0;
+			for (const id of s) if (first.has(id)) common++;
+			return common / (s.size + first.size - common) >= .8;
+		})) groups.push({
+			dir,
+			docs: list
+		});
+	}
+	if (!groups.length) return void 0;
+	const inGroup = new Set(groups.flatMap((g) => g.docs));
+	const system = {
+		sets: /* @__PURE__ */ new Map([["base", docs.filter((d) => !inGroup.has(d))]]),
+		modifiers: /* @__PURE__ */ new Map(),
+		order: [{
+			kind: "set",
+			name: "base"
+		}],
+		synthetic: true
+	};
+	for (const g of groups) {
+		const contexts = g.docs.map((d) => stem(d.file));
+		let name = contexts.some((c) => THEME_WORDS.has(c.toLowerCase())) ? "theme" : stem(g.dir) || "mode";
+		for (let i = 2; system.modifiers.has(name); i++) name = `${name.replace(/-\d+$/, "")}-${i}`;
+		const light = contexts.find((c) => c.toLowerCase() === "light");
+		system.modifiers.set(name, {
+			contexts: new Map(g.docs.map((d) => [stem(d.file), [d]])),
+			default: light ?? contexts[0]
+		});
+		system.order.push({
+			kind: "modifier",
+			name
+		});
+		diag.info("tokens/mode-files", `Files in ${g.dir || "the root"} are modes of one collection: ${name} (${contexts.join(", ")})`);
+	}
+	return system;
+}
 //#endregion
 //#region ../dsgraph-core/dist/resolver/resolve.js
 /** Caches flattened documents across inputs. */
@@ -11172,7 +11232,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.1.0-alpha.0";
+const GENERATOR = "dsgraph@0.1.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -11453,7 +11513,7 @@ async function loadSystem(source, config, diag, opts = {}) {
 	} catch (e) {
 		diag.error("tokens/invalid-json", e.message, { file });
 	}
-	return expandModes(systemFromDocuments(docs), diag);
+	return expandModes(systemFromModeFiles(docs, diag) ?? systemFromDocuments(docs), diag);
 }
 const isEmpty = (s) => [...s.sets.values()].every((d) => d.length === 0) && [...s.modifiers.values()].every((m) => [...m.contexts.values()].every((d) => d.length === 0));
 /** Scans a source into a snapshot. */
@@ -18229,6 +18289,8 @@ const ROOT_LIKE = /^(:root|html|:host|body|\*)(:not\([^)]*\))*$/;
 const ATTR_THEME = /^(?::root|html|body|:host)?\[(data-[\w-]+)(?:=["']?([\w-]+)["']?)?\](:not\([^)]*\))*$/;
 const CLASS_THEME = /^(?::root|html|body|:host)?\.(dark|light|theme-([\w-]+)|([\w-]+)-theme)(:not\([^)]*\))*$/;
 const COLOR_SCHEME = /prefers-color-scheme\s*:\s*(dark|light)/i;
+/** Several attributes at once: `[data-color-mode="dark"][data-dark-theme="dark_dimmed"]`. */
+const COMPOUND_ATTR = /^(?::root|html|body|:host)?((?:\[data-[\w-]+(?:=["']?[\w-]+["']?)?\]){2,})(:not\([^)]*\))*$/;
 const norm = (s) => s.replace(/\s+/g, " ").replace(/["']/g, "").trim().toLowerCase();
 /** Conditional at-rules around a declaration, outermost first (`@layer` is ignored). */
 function atRulesOf(decl) {
@@ -18243,6 +18305,26 @@ function atRulesOf(decl) {
 	}
 	return out;
 }
+/** Well-known conditions under the names people use for them. */
+const KNOWN_CONDITIONS = [
+	[/display-p3|color-gamut\s*:\s*p3/, "display-p3"],
+	[/color-gamut\s*:\s*rec2020/, "rec2020"],
+	[/prefers-reduced-motion\s*:\s*reduce/, "reduced-motion"],
+	[/prefers-contrast\s*:\s*more/, "high-contrast"],
+	[/prefers-contrast\s*:\s*less/, "low-contrast"],
+	[/forced-colors\s*:\s*active/, "forced-colors"]
+];
+/**
+* A short modifier name for an at-rule: `@media (min-width: 768px)` → `min-width: 768px`,
+* `@supports (color: color(display-p3 1 1 1))` → `display-p3`.
+*/
+function conditionName(atRule) {
+	for (const [re, name] of KNOWN_CONDITIONS) if (re.test(atRule)) return name;
+	const m = /^@(\w+)\s*(.*)$/.exec(atRule.trim());
+	if (!m) return atRule;
+	const params = m[2].replace(/^\((.*)\)$/, "$1").replace(/\(([^()]*)\)/g, "").replace(/\s+/g, " ").trim();
+	return m[1] === "media" ? params : `${m[1]} ${params}`;
+}
 function autoPlacement(selectors, atRules) {
 	const media = atRules.find((a) => !COLOR_SCHEME.test(a));
 	const scheme = atRules.map((a) => COLOR_SCHEME.exec(a)?.[1]?.toLowerCase()).find(Boolean);
@@ -18251,7 +18333,7 @@ function autoPlacement(selectors, atRules) {
 		if (ROOT_LIKE.test(sel)) {
 			if (media) return {
 				kind: "context",
-				modifier: media,
+				modifier: conditionName(media),
 				context: "on",
 				boolean: true
 			};
@@ -18274,6 +18356,15 @@ function autoPlacement(selectors, atRules) {
 			modifier: "theme",
 			context: cls[2] ?? cls[3] ?? cls[1]
 		};
+		const compound = COMPOUND_ATTR.exec(sel);
+		if (compound && !media) {
+			const values = [...compound[1].matchAll(/=["']?([\w-]+)["']?\]/g)].map((m) => m[1]);
+			if (values.length) return {
+				kind: "context",
+				modifier: "theme",
+				context: values[values.length - 1]
+			};
+		}
 	}
 	return { kind: "skip" };
 }
@@ -18423,7 +18514,7 @@ const cssTokens = {
 };
 //#endregion
 //#region ../dsgraph-adapters/dist/json-values.js
-/** Tokens Studio and Style Dictionary types → DTCG types. Others keep their own name. */
+/** Types of token-set and value/type JSON → DTCG types. Others keep their own name. */
 const TYPES = {
 	color: "color",
 	dimension: "dimension",
@@ -18457,11 +18548,11 @@ const TYPES = {
 	transition: "transition",
 	gradient: "gradient"
 };
-/** `border-radius` (Style Dictionary) → `borderRadius`. */
+/** `border-radius` (kebab-case types) → `borderRadius`. */
 const mapKey = (t) => t.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
 const mapType = (t) => TYPES[t] ?? TYPES[mapKey(t)] ?? t;
-/** Types only Tokens Studio uses; their presence tells Tokens Studio from Style Dictionary. */
-const STUDIO_ONLY_TYPES = /* @__PURE__ */ new Set([
+/** Types only the token-set format uses; their presence tells it from plain value/type JSON. */
+const SET_FORMAT_TYPES = /* @__PURE__ */ new Set([
 	"sizing",
 	"spacing",
 	"borderRadius",
@@ -18504,7 +18595,7 @@ const NUM = /^\s*(-?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)\s*$/i;
 const isObj$1 = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 /**
 * References as these tools write them, in DTCG syntax: `{a.b.value}` and `{a.b.$value}` drop the
-* suffix, a whole-value `$a.b` (early Tokens Studio) becomes `{a.b}`.
+* suffix, a whole-value `$a.b` (an early notation) becomes `{a.b}`.
 */
 function normalizeRefs(v) {
 	if (typeof v === "string") {
@@ -18672,7 +18763,7 @@ function duration(v) {
 	};
 	return v;
 }
-/** Style Dictionary's category/type/item: the first path segment says what an untyped token is. */
+/** Category/type/item naming: the first path segment says what an untyped token is. */
 function inferType(path, v, c) {
 	const category = path[0]?.toLowerCase();
 	if (category === "color" || category === "colors") return {
@@ -18800,11 +18891,13 @@ const groupType = (sourceType) => {
 };
 //#endregion
 //#region ../dsgraph-adapters/dist/tokens-json.js
+/** The `$extensions` key under which token-set files keep color modifiers (`modify`). */
+const MODIFIER_EXTENSION = "studio.tokens";
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const base = (p) => p.slice(p.lastIndexOf("/") + 1);
 const dir = (p) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
 const META = /(^|\/)\$(themes|metadata)\.json$/;
-/** `{ value }` without `$`: a token as Tokens Studio and Style Dictionary write it. */
+/** `{ value }` without `$`: a token in value/type JSON, the older token notation. */
 function isLegacyToken(o) {
 	if (!Object.hasOwn(o, "value") || Object.hasOwn(o, "$value")) return false;
 	const v = o.value;
@@ -18852,7 +18945,7 @@ const newSurvey = () => ({
 	legacy: 0,
 	dtcg: 0,
 	typed: 0,
-	studioTypes: 0,
+	setTypes: 0,
 	values: /* @__PURE__ */ new Set(),
 	ids: /* @__PURE__ */ new Set()
 });
@@ -18865,14 +18958,14 @@ function survey(node, s, inheritsType = false, path = []) {
 		else s.legacy++;
 		const own = node.type ?? node.$type;
 		if (typeof own === "string" || inheritsType || schemaType(tree)) s.typed++;
-		if (typeof own === "string" && STUDIO_ONLY_TYPES.has(own)) s.studioTypes++;
+		if (typeof own === "string" && SET_FORMAT_TYPES.has(own)) s.setTypes++;
 		const v = dollar ? tree.$value : tree.value;
 		if (typeof v === "string" && !v.includes("{") || typeof v === "number") s.values.add(String(v).trim().toLowerCase());
 		s.ids.add(path.join("."));
 		return;
 	}
 	const groupType = typeof tree.$type === "string";
-	if (groupType && STUDIO_ONLY_TYPES.has(tree.$type)) s.studioTypes++;
+	if (groupType && SET_FORMAT_TYPES.has(tree.$type)) s.setTypes++;
 	for (const [k, v] of Object.entries(tree)) if (!k.startsWith("$")) survey(v, s, inheritsType || groupType, [...path, k]);
 }
 /** JSON Schema documents describe tokens; they are not tokens. */
@@ -18901,20 +18994,20 @@ async function readAll(source, config, diag) {
 const hasMarkers = (f) => META.test(f.file) || isObj(f.tree) && ("$themes" in f.tree || "$metadata" in f.tree);
 /**
 * Which tool wrote these files, or undefined for typed DTCG (left to the core). DTCG syntax
-* without any `$type` is read like Style Dictionary: types come from names and values.
+* without any `$type` is read like value/type JSON: types come from names and values.
 */
 function dialectOf(files) {
 	const s = newSurvey();
 	for (const f of files) survey(f.tree, s);
 	const tokenFiles = files.filter((f) => !hasMarkers(f));
 	const setsAtTop = tokenFiles.length === 1 && isObj(tokenFiles[0].tree) && topLevelAreSets(tokenFiles[0].tree);
-	if (files.some(hasMarkers) || s.studioTypes > 0 || setsAtTop) return "tokens-studio";
-	if (s.legacy > 0) return "style-dictionary";
-	if (s.dtcg > 0 && s.typed === 0) return "style-dictionary";
+	if (files.some(hasMarkers) || s.setTypes > 0 || setsAtTop) return "token-sets";
+	if (s.legacy > 0) return "legacy-json";
+	if (s.dtcg > 0 && s.typed === 0) return "legacy-json";
 }
-/** Prefer the export with the most typed tokens; then DTCG, Tokens Studio, Style Dictionary. */
+/** Prefer the export with the most typed tokens; then DTCG, token sets, value/type JSON. */
 function rankOf(s) {
-	return Math.round(s.typed / Math.max(1, s.legacy + s.dtcg) * 10) * 10 + (s.studioTypes > 0 ? 3 : s.legacy > 0 ? 2 : 4);
+	return Math.round(s.typed / Math.max(1, s.legacy + s.dtcg) * 10) * 10 + (s.setTypes > 0 ? 3 : s.legacy > 0 ? 2 : 4);
 }
 const jaccard = (a, b) => {
 	let common = 0;
@@ -18931,11 +19024,11 @@ function alternatives(a, b) {
 	const nb = b.legacy + b.dtcg;
 	if (Math.min(na, nb) / Math.max(na, nb) < .7) return false;
 	if (jaccard(a.values, b.values) < .5) return false;
-	return !(a.studioTypes > 0 === b.studioTypes > 0 && a.dtcg > 0 === b.dtcg > 0) || jaccard(a.ids, b.ids) >= .8;
+	return !(a.setTypes > 0 === b.setTypes > 0 && a.dtcg > 0 === b.dtcg > 0) || jaccard(a.ids, b.ids) >= .8;
 }
 /**
 * Packages often ship the same tokens in several formats (`tokens.json`,
-* `figma-tokens.json`, `style-dictionary-tokens.json`). Files whose literal values mostly
+* `tokens.figma.json`, `tokens.legacy.json`). Files whose literal values mostly
 * coincide are alternatives: only the best-typed one is read.
 */
 function pickExports(files, diag) {
@@ -19062,9 +19155,9 @@ function convertToken(node, path, dialect, unit, inherited) {
 	if (c.expression) dev.expression = { unit };
 	if (sourceType && sourceType !== type) dev.sourceType = sourceType;
 	if (typeof node.uuid === "string" && node.uuid) dev.stableId = node.uuid;
-	const studio = ext["studio.tokens"];
-	if (isObj(studio) && isObj(studio.modify) && typeof studio.modify.type === "string") {
-		const m = studio.modify;
+	const carrier = ext[MODIFIER_EXTENSION];
+	if (isObj(carrier) && isObj(carrier.modify) && typeof carrier.modify.type === "string") {
+		const m = carrier.modify;
 		dev.colorModifier = {
 			type: m.type,
 			value: m.value,
@@ -19091,7 +19184,7 @@ function themesOf(raw, diag, file) {
 			sets
 		});
 	}
-	if (out.length === 0 && raw.length > 0) diag.warn("tokens-studio/invalid-themes", "No usable themes found", { file });
+	if (out.length === 0 && raw.length > 0) diag.warn("token-sets/invalid-themes", "No usable themes found", { file });
 	return out;
 }
 /** Ids of tokens in a tree, prefixed by `prefix`. */
@@ -19109,7 +19202,7 @@ function refsIn(v, out) {
 	else if (isObj(v)) for (const x of Object.values(v)) refsIn(x, out);
 }
 /**
-* A single Tokens Studio file keeps token sets as top-level keys; references then leave the set
+* A single exported token-set file keeps its sets as top-level keys; references then leave the set
 * name out. Without `$themes`/`$metadata` the references decide which reading resolves more.
 */
 function topLevelAreSets(tree) {
@@ -19124,7 +19217,7 @@ function topLevelAreSets(tree) {
 	const hits = (ids) => refs.filter((r) => ids.has(r)).length;
 	return hits(asSets) > hits(asGroups);
 }
-function studioSystem(files, diag) {
+function setsSystem(files, diag) {
 	const unit = "px";
 	const sets = /* @__PURE__ */ new Map();
 	let order;
@@ -19142,13 +19235,13 @@ function studioSystem(files, diag) {
 		if ("$themes" in f.tree || "$metadata" in f.tree || single && topLevelAreSets(f.tree)) {
 			for (const [name, tree] of Object.entries(f.tree)) if (!name.startsWith("$") && isObj(tree)) sets.set(name, {
 				file: `${f.file}#/${name}`,
-				tree: convertTree(tree, "tokens-studio", unit)
+				tree: convertTree(tree, "token-sets", unit)
 			});
 		} else {
 			const name = (root && f.file.startsWith(`${root}/`) ? f.file.slice(root.length + 1) : f.file).replace(/\.(json|tokens)$/i, "");
 			sets.set(name, {
 				file: f.file,
-				tree: convertTree(f.tree, "tokens-studio", unit)
+				tree: convertTree(f.tree, "token-sets", unit)
 			});
 		}
 	}
@@ -19162,11 +19255,11 @@ function studioSystem(files, diag) {
 			name: "base"
 		}],
 		synthetic: true,
-		kind: "tokens-studio"
+		kind: "token-sets"
 	};
 	if (themes.length === 0) {
 		system.sets.set("base", docs(names));
-		if (sets.size > 1) diag.info("tokens-studio/no-themes", `No themes: ${sets.size} token sets are merged in set order`);
+		if (sets.size > 1) diag.info("token-sets/no-themes", `No themes: ${sets.size} token sets are merged in set order`);
 		return system;
 	}
 	const used = (t) => new Set(names.filter((n) => t.sets.get(n) === "enabled" || t.sets.get(n) === "source"));
@@ -19193,13 +19286,13 @@ function studioSystem(files, diag) {
 		});
 	}
 	const unused = names.filter((n) => !themes.some((t) => used(t).has(n)));
-	if (unused.length > 0) diag.info("tokens-studio/unused-sets", `Token sets in no theme are not read: ${unused.join(", ")}`);
+	if (unused.length > 0) diag.info("token-sets/unused-sets", `Token sets in no theme are not read: ${unused.join(", ")}`);
 	return system;
 }
 /**
-* Tokens Studio and Style Dictionary JSON → token system (DTCG 2025.10 values).
-* Tokens Studio: token sets (one file each, or top-level keys of one file), `$metadata.json` for
-* set order and `$themes.json` for themes; theme groups become modifiers. Style Dictionary: every
+* Token-set JSON and value/type JSON → token system (DTCG 2025.10 values).
+* Token sets: one file each or top-level keys of one file, `$metadata.json` for
+* set order and `$themes.json` for themes; theme groups become modifiers. Value/type JSON: every
 * file merges into one set, untyped tokens take their type from the category (`color`, `size`,
 * `time`) or the value. Plain DTCG files are left to the core.
 */
@@ -19215,10 +19308,10 @@ const jsonTokens = {
 		const all = await readAll(source, config, diag);
 		pickExports(all, diag);
 		const loaded = all.filter((f) => wanted.has(f.file));
-		if ((dialectOf(loaded) ?? "style-dictionary") === "tokens-studio") return studioSystem(loaded, diag);
+		if ((dialectOf(loaded) ?? "legacy-json") === "token-sets") return setsSystem(loaded, diag);
 		const docs = loaded.map((f) => ({
 			file: f.file,
-			tree: convertTree(f.tree, "style-dictionary", "px")
+			tree: convertTree(f.tree, "legacy-json", "px")
 		}));
 		return {
 			sets: /* @__PURE__ */ new Map([["default", docs]]),
@@ -19228,7 +19321,7 @@ const jsonTokens = {
 				name: "default"
 			}],
 			synthetic: true,
-			kind: "style-dictionary"
+			kind: "legacy-json"
 		};
 	}
 };
