@@ -3173,7 +3173,14 @@ const Config = Type.Object({
 			px: Type.Optional(Type.Number())
 		}))
 	})),
-	rules: Type.Optional(Type.Record(Type.String(), RuleSetting))
+	rules: Type.Optional(Type.Record(Type.String(), RuleSetting)),
+	/** The project that uses the tokens: style files checked by `style/*` and `usage/*` rules and by impact. */
+	code: Type.Optional(Type.Object({
+		include: Type.Optional(Type.Array(Type.String())),
+		exclude: Type.Optional(Type.Array(Type.String())),
+		/** Prefix of the design system's custom properties in code, e.g. `--ds-`; learned when left out. */
+		prefix: Type.Optional(Type.String())
+	}))
 }, { $id: "Config" });
 //#endregion
 //#region ../../node_modules/@sinclair/typebox/build/esm/errors/function.mjs
@@ -4038,46 +4045,6 @@ function validate(schema, value) {
 const validateSnapshot = (value) => validate(Snapshot, value);
 const validateConfig = (value) => validate(Config, value);
 //#endregion
-//#region ../dsgraph-core/dist/diagnostics.js
-/** Collects diagnostics, deduplicating identical entries. */
-var DiagnosticBag = class {
-	items = /* @__PURE__ */ new Map();
-	add(code, severity, message, loc) {
-		const d = loc ? {
-			code,
-			severity,
-			message,
-			loc
-		} : {
-			code,
-			severity,
-			message
-		};
-		const key = canonicalize(d);
-		if (!this.items.has(key)) this.items.set(key, d);
-	}
-	error(code, message, loc) {
-		this.add(code, "error", message, loc);
-	}
-	warn(code, message, loc) {
-		this.add(code, "warning", message, loc);
-	}
-	info(code, message, loc) {
-		this.add(code, "info", message, loc);
-	}
-	merge(other) {
-		for (const d of other.list()) this.add(d.code, d.severity, d.message, d.loc);
-	}
-	hasErrors() {
-		for (const d of this.items.values()) if (d.severity === "error") return true;
-		return false;
-	}
-	/** Sorted by file, pointer, code, message for deterministic output. */
-	list() {
-		return [...this.items.values()].sort((a, b) => (a.loc?.file ?? "").localeCompare(b.loc?.file ?? "") || (a.loc?.pointer ?? "").localeCompare(b.loc?.pointer ?? "") || a.code.localeCompare(b.code) || a.message.localeCompare(b.message));
-	}
-};
-//#endregion
 //#region ../dsgraph-core/dist/path.js
 /** Token paths, dot-path globs and cross-source name normalization. */
 const tokenId = (path) => path.join(".");
@@ -4170,322 +4137,6 @@ function cssVarToName(cssVar, prefix = "--") {
 	if (prefix && n.startsWith(prefix)) n = n.slice(prefix.length);
 	else if (n.startsWith("--")) n = n.slice(2);
 	return normalizeName(n);
-}
-//#endregion
-//#region ../dsgraph-core/dist/pointer.js
-/** JSON Pointer helpers (RFC 6901). */
-const escapeSegment = (s) => s.replace(/~/g, "~0").replace(/\//g, "~1");
-const unescapeSegment = (s) => s.replace(/~1/g, "/").replace(/~0/g, "~");
-function toPointer(segments) {
-	return segments.map((s) => `/${escapeSegment(String(s))}`).join("");
-}
-/** Parses `#/a/b`, `/a/b` or `#` into segments; returns null for invalid syntax. */
-function parsePointer(pointer) {
-	let p = pointer;
-	if (p.startsWith("#")) p = p.slice(1);
-	if (p === "") return [];
-	if (!p.startsWith("/")) return null;
-	return p.slice(1).split("/").map(unescapeSegment);
-}
-function getAt(value, segments) {
-	let cur = value;
-	for (const seg of segments) if (Array.isArray(cur)) {
-		if (!/^(0|[1-9]\d*)$/.test(seg)) return {
-			found: false,
-			value: void 0
-		};
-		const i = Number(seg);
-		if (i >= cur.length) return {
-			found: false,
-			value: void 0
-		};
-		cur = cur[i];
-	} else if (cur !== null && typeof cur === "object" && Object.hasOwn(cur, seg)) cur = cur[seg];
-	else return {
-		found: false,
-		value: void 0
-	};
-	return {
-		found: true,
-		value: cur
-	};
-}
-//#endregion
-//#region ../dsgraph-core/dist/resolver/system.js
-/** Wraps plain token files into a synthetic system with one set and no modifiers. */
-function systemFromDocuments(docs) {
-	return {
-		sets: /* @__PURE__ */ new Map([["default", docs]]),
-		modifiers: /* @__PURE__ */ new Map(),
-		order: [{
-			kind: "set",
-			name: "default"
-		}],
-		synthetic: true
-	};
-}
-const ACCEPTED_VERSIONS = /* @__PURE__ */ new Set([
-	"2025.10",
-	"2025-10-01",
-	"2025-11-01"
-]);
-function dirname$3(path) {
-	const i = path.lastIndexOf("/");
-	return i < 0 ? "" : path.slice(0, i);
-}
-function joinPath(base, rel) {
-	const parts = (base ? `${base}/${rel}` : rel).split("/");
-	const out = [];
-	for (const p of parts) {
-		if (p === "" || p === ".") continue;
-		if (p === "..") out.pop();
-		else out.push(p);
-	}
-	return out.join("/");
-}
-/**
-* Parses a resolver document (Resolver 2025.10). Tolerant of known inconsistencies in the
-* specification itself (version spelled as a date, `context` instead of `contexts`).
-*/
-async function systemFromResolver(tree, file, load, diag) {
-	const system = {
-		sets: /* @__PURE__ */ new Map(),
-		modifiers: /* @__PURE__ */ new Map(),
-		order: [],
-		synthetic: false,
-		file
-	};
-	const at = (pointer) => ({
-		file,
-		pointer
-	});
-	if (!isPlainObject(tree)) {
-		diag.error("resolver/invalid-document", "A resolver document must be a JSON object", at(""));
-		return system;
-	}
-	if (tree.version === void 0) diag.error("resolver/missing-version", "Resolver must declare \"version\"", at(""));
-	else if (!ACCEPTED_VERSIONS.has(String(tree.version))) diag.warn("resolver/unknown-version", `Unknown resolver version "${String(tree.version)}"`, at("/version"));
-	else if (tree.version !== "2025.10") diag.info("resolver/version-date", `Version "${String(tree.version)}" is read as 2025.10`, at("/version"));
-	const fileCache = /* @__PURE__ */ new Map();
-	const loadFile = async (path) => {
-		if (!fileCache.has(path)) fileCache.set(path, await load(path));
-		return fileCache.get(path);
-	};
-	const sourcesOf = async (items, pointer, allowSetRefs) => {
-		if (!Array.isArray(items)) {
-			diag.error("resolver/invalid-sources", "Sources must be an array", at(pointer));
-			return [];
-		}
-		const docs = [];
-		for (const [i, item] of items.entries()) {
-			const p = `${pointer}/${i}`;
-			if (!isPlainObject(item)) {
-				diag.error("resolver/invalid-source", "Each source must be a reference object or inline tokens", at(p));
-				continue;
-			}
-			if (typeof item.$ref !== "string") {
-				docs.push({
-					file: `${file}#${p}`,
-					tree: item
-				});
-				continue;
-			}
-			const { $ref, ...siblings } = item;
-			const ref = $ref;
-			if (ref.startsWith("#")) {
-				const segs = parsePointer(ref);
-				if (!segs) {
-					diag.error("resolver/invalid-pointer", `Malformed pointer "${ref}"`, at(p));
-					continue;
-				}
-				if (segs[0] === "modifiers" || segs[0] === "resolutionOrder") {
-					diag.error("resolver/invalid-pointer", `Sources must not reference "${ref}"`, at(p));
-					continue;
-				}
-				if (segs[0] === "sets" && segs.length === 2) {
-					if (!allowSetRefs) continue;
-					const set = isPlainObject(tree.sets) ? tree.sets[segs[1]] : void 0;
-					if (!isPlainObject(set)) diag.error("resolver/invalid-pointer", `Set "${segs[1]}" not found`, at(p));
-					else docs.push(...await sourcesOf(set.sources, toPointer([
-						"sets",
-						segs[1],
-						"sources"
-					]), false));
-					continue;
-				}
-				const found = getAt(tree, segs);
-				if (!found.found) diag.error("resolver/invalid-pointer", `"${ref}" not found`, at(p));
-				else docs.push({
-					file: `${file}#${toPointer(segs)}`,
-					tree: override(found.value, siblings)
-				});
-				continue;
-			}
-			if (/^[a-z]+:\/\//i.test(ref)) {
-				diag.warn("resolver/remote-unsupported", `Remote source "${ref}" is not loaded`, at(p));
-				continue;
-			}
-			const [filePart, fragment] = ref.split("#");
-			const path = joinPath(dirname$3(file), filePart);
-			let content;
-			try {
-				content = await loadFile(path);
-			} catch (e) {
-				diag.error("resolver/source-not-found", `Cannot load "${path}": ${e.message}`, at(p));
-				continue;
-			}
-			if (fragment !== void 0) {
-				const segs = parsePointer(fragment.startsWith("/") ? fragment : `/${fragment}`);
-				const found = segs ? getAt(content, segs) : {
-					found: false,
-					value: void 0
-				};
-				if (!found.found) {
-					diag.error("resolver/invalid-pointer", `"${ref}" not found`, at(p));
-					continue;
-				}
-				content = found.value;
-			}
-			docs.push({
-				file: fragment !== void 0 ? `${path}#${fragment}` : path,
-				tree: override(content, siblings)
-			});
-		}
-		return docs;
-	};
-	const defineSet = async (name, def, pointer) => {
-		if (!isPlainObject(def)) {
-			diag.error("resolver/invalid-set", `Set "${name}" must be an object`, at(pointer));
-			return;
-		}
-		system.sets.set(name, await sourcesOf(def.sources, `${pointer}/sources`, true));
-	};
-	const defineModifier = async (name, def, pointer) => {
-		if (!isPlainObject(def)) {
-			diag.error("resolver/invalid-modifier", `Modifier "${name}" must be an object`, at(pointer));
-			return;
-		}
-		let contexts = def.contexts;
-		let key = "contexts";
-		if (contexts === void 0 && def.context !== void 0) {
-			contexts = def.context;
-			key = "context";
-			diag.warn("resolver/context-typo", `Modifier "${name}" uses "context"; the property is "contexts"`, at(pointer));
-		}
-		if (!isPlainObject(contexts) || Object.keys(contexts).length === 0) {
-			diag.error("resolver/no-contexts", `Modifier "${name}" must declare at least one context`, at(pointer));
-			return;
-		}
-		if (Object.keys(contexts).length === 1) diag.warn("resolver/single-context", `Modifier "${name}" has a single context; use a set instead`, at(pointer));
-		const m = { contexts: /* @__PURE__ */ new Map() };
-		for (const [ctx, items] of Object.entries(contexts)) m.contexts.set(ctx, await sourcesOf(items, `${pointer}/${key}/${ctx}`, true));
-		if (def.default !== void 0) {
-			if (typeof def.default === "string" && m.contexts.has(def.default)) m.default = def.default;
-			else diag.error("resolver/invalid-default", `Default "${String(def.default)}" is not a context of "${name}"`, at(pointer));
-		}
-		if (typeof def.description === "string") m.description = def.description;
-		system.modifiers.set(name, m);
-	};
-	const setDefs = isPlainObject(tree.sets) ? tree.sets : {};
-	const modifierDefs = isPlainObject(tree.modifiers) ? tree.modifiers : {};
-	let order = tree.resolutionOrder;
-	if (!Array.isArray(order)) {
-		diag.error("resolver/missing-resolution-order", "Resolver must declare \"resolutionOrder\"", at(""));
-		order = [...Object.keys(setDefs).map((n) => ({ $ref: `#/sets/${n}` })), ...Object.keys(modifierDefs).map((n) => ({ $ref: `#/modifiers/${n}` }))];
-	}
-	const seen = /* @__PURE__ */ new Set();
-	for (const [i, item] of order.entries()) {
-		const p = `/resolutionOrder/${i}`;
-		if (!isPlainObject(item)) {
-			diag.error("resolver/invalid-order-item", "Resolution order items must be objects", at(p));
-			continue;
-		}
-		let kind;
-		let name;
-		if (typeof item.$ref === "string") {
-			const segs = parsePointer(item.$ref);
-			if (segs && segs.length === 2 && (segs[0] === "sets" || segs[0] === "modifiers")) {
-				kind = segs[0] === "sets" ? "set" : "modifier";
-				name = segs[1];
-				const defs = kind === "set" ? setDefs : modifierDefs;
-				if (!(name in defs)) {
-					diag.error("resolver/invalid-pointer", `"${item.$ref}" not found`, at(p));
-					continue;
-				}
-				if (kind === "set" && !system.sets.has(name)) await defineSet(name, defs[name], `/sets/${name}`);
-				if (kind === "modifier" && !system.modifiers.has(name)) await defineModifier(name, defs[name], `/modifiers/${name}`);
-			} else {
-				diag.error("resolver/invalid-pointer", `Resolution order must reference a set or modifier`, at(p));
-				continue;
-			}
-		} else if ((item.type === "set" || item.type === "modifier") && typeof item.name === "string") {
-			kind = item.type;
-			name = item.name;
-			if (kind === "set") await defineSet(name, item, p);
-			else await defineModifier(name, item, p);
-		} else {
-			diag.error("resolver/invalid-order-item", "Inline items need \"type\" (set | modifier) and \"name\"", at(p));
-			continue;
-		}
-		if (seen.has(name)) diag.error("resolver/duplicate-name", `"${name}" appears twice in resolutionOrder`, at(p));
-		seen.add(name);
-		system.order.push({
-			kind,
-			name
-		});
-	}
-	return system;
-}
-function override(value, siblings) {
-	if (Object.keys(siblings).length === 0 || !isPlainObject(value)) return value;
-	return {
-		...value,
-		...siblings
-	};
-}
-/** Modifiers in resolution order with contexts in declaration order. */
-function modifiersOf(system) {
-	const out = [];
-	for (const item of system.order) {
-		if (item.kind !== "modifier") continue;
-		const m = system.modifiers.get(item.name);
-		if (!m) continue;
-		const mod = {
-			name: item.name,
-			contexts: [...m.contexts.keys()]
-		};
-		if (m.default) mod.default = m.default;
-		out.push(mod);
-	}
-	return out;
-}
-/** Cartesian product of all modifier contexts, deterministic order. */
-function enumerateInputs(modifiers) {
-	let inputs = [{}];
-	for (const m of modifiers) inputs = inputs.flatMap((i) => m.contexts.map((c) => ({
-		...i,
-		[m.name]: c
-	})));
-	return inputs;
-}
-function defaultInput(modifiers, configured = {}) {
-	const input = {};
-	for (const m of modifiers) {
-		const c = configured[m.name];
-		input[m.name] = c !== void 0 && m.contexts.includes(c) ? c : m.default ?? m.contexts[0];
-	}
-	return input;
-}
-/** Documents for an input, in resolution order. */
-function selectDocuments(system, input) {
-	const docs = [];
-	for (const item of system.order) if (item.kind === "set") docs.push(...system.sets.get(item.name) ?? []);
-	else {
-		const m = system.modifiers.get(item.name);
-		const ctx = input[item.name];
-		if (m && ctx !== void 0) docs.push(...m.contexts.get(ctx) ?? []);
-	}
-	return docs;
 }
 //#endregion
 //#region ../../node_modules/culori/src/rgb/parseNumber.js
@@ -4713,7 +4364,7 @@ const parseRgbLegacy = (color) => {
 };
 //#endregion
 //#region ../../node_modules/culori/src/_prepare.js
-const prepare = (color, mode) => color === void 0 ? void 0 : typeof color !== "object" ? parse$2(color) : color.mode !== void 0 ? color : mode ? {
+const prepare = (color, mode) => color === void 0 ? void 0 : typeof color !== "object" ? parse$4(color) : color.mode !== void 0 ? color : mode ? {
 	...color,
 	mode
 } : void 0;
@@ -5001,7 +4652,7 @@ function parseModernSyntax(tokens, includeHue) {
 	coords.unshift(token.value);
 	return coords;
 }
-const parse$2 = (color) => {
+const parse$4 = (color) => {
 	if (typeof color !== "string") return;
 	const tokens = tokenize(color);
 	const parsed = tokens ? parseModernSyntax(tokens, true) : void 0;
@@ -7945,9 +7596,9 @@ function fromCulori(obj) {
 	return value;
 }
 /** culori's parser, which throws on some non-color input (e.g. `clamp(…)`): undefined instead. */
-function parse$1(css) {
+function parse$3(css) {
 	try {
-		return parse$2(css);
+		return parse$4(css);
 	} catch {
 		return;
 	}
@@ -7982,7 +7633,7 @@ function deltaEOK(a, b) {
 }
 /** Parses any CSS Color 4 string into a DTCG 2025.10 color object; undefined if not a color. */
 function cssColorToDtcg(css) {
-	const parsed = parse$1(css.trim());
+	const parsed = parse$3(css.trim());
 	if (!parsed) return void 0;
 	return colorToDtcg(fromCulori(parsed));
 }
@@ -7999,7 +7650,7 @@ function colorToDtcg(c) {
 /** A CSS string or a DTCG color object as a color, without diagnostics; undefined if neither. */
 function looseColor(raw) {
 	if (typeof raw === "string") {
-		const parsed = parse$1(raw.trim());
+		const parsed = parse$3(raw.trim());
 		return parsed ? fromCulori(parsed) : void 0;
 	}
 	if (!isPlainObject(raw) || !Array.isArray(raw.components) || raw.components.length !== 3) return void 0;
@@ -8039,9 +7690,9 @@ function composedColor(raw, ctx) {
 		alpha: base.alpha * alpha
 	};
 }
-function canonicalColor(raw, ctx) {
+function canonicalColor$1(raw, ctx) {
 	if (typeof raw === "string") {
-		const parsed = parse$1(raw);
+		const parsed = parse$3(raw);
 		if (!parsed) return invalid(ctx, "dtcg/invalid-color", `"${raw}" is not a valid color`);
 		if (!lenient(ctx, "dtcg/legacy-syntax", `Color "${raw}" is a string; DTCG 2025.10 requires an object`)) return void 0;
 		return fromCulori(parsed);
@@ -8110,6 +7761,465 @@ function canonicalDimension(raw, ctx) {
 	return value;
 }
 //#endregion
+//#region ../dsgraph-core/dist/code.js
+/**
+* Matches custom property names from code to tokens. Ids of CSS tokens match as written; DTCG paths
+* match by normalized name (`--color-blue-500` ↔ `color.blue.500`). A prefix (`--ds-`) is taken from
+* `prefix`, or learned: a leading segment that several names share and that, removed, names tokens.
+*/
+var VarMatcher = class {
+	graph;
+	prefixes;
+	constructor(graph, names = [], prefix) {
+		this.graph = graph;
+		this.prefixes = prefix ? [normalizeName(prefix.replace(/^--/, ""))] : learnPrefixes(graph, names);
+	}
+	/** The token a custom property names, or undefined. */
+	token(name) {
+		const bare = name.replace(/^--/, "");
+		const exact = this.graph.token(bare);
+		if (exact) return exact;
+		const n = normalizeName(bare);
+		const direct = this.byName(n);
+		if (direct) return direct;
+		for (const p of this.prefixes) if (n.startsWith(`${p}.`)) return this.byName(n.slice(p.length + 1));
+	}
+	/** Whether a custom property is meant to be a design-system variable (carries a known prefix). */
+	isSystemName(name) {
+		const n = normalizeName(name.replace(/^--/, ""));
+		return this.prefixes.some((p) => n.startsWith(`${p}.`));
+	}
+	get prefix() {
+		return this.prefixes[0];
+	}
+	byName(n) {
+		const hits = this.graph.byCssVar(`--${n}`);
+		return hits.length === 1 ? hits[0] : void 0;
+	}
+};
+/** Leading segments that, removed, turn most names that carry them into token names. */
+function learnPrefixes(graph, names) {
+	const stats = /* @__PURE__ */ new Map();
+	for (const name of new Set(names)) {
+		const n = normalizeName(name.replace(/^--/, ""));
+		if (graph.token(name.replace(/^--/, "")) || graph.byCssVar(`--${n}`).length) continue;
+		const dot = n.indexOf(".");
+		if (dot < 0) continue;
+		const head = n.slice(0, dot);
+		const s = stats.get(head) ?? {
+			total: 0,
+			hits: 0
+		};
+		s.total++;
+		if (graph.byCssVar(`--${n.slice(dot + 1)}`).length === 1) s.hits++;
+		stats.set(head, s);
+	}
+	return [...stats].filter(([, s]) => s.hits >= 2 && s.hits / s.total >= .5).sort((a, b) => b[1].hits - a[1].hits || a[0].localeCompare(b[0])).map(([p]) => p);
+}
+const REM = 16;
+/** How far apart two values of a type are, in the unit people think in; undefined when not comparable. */
+function valueDistance(type, a, b, remBase = REM) {
+	if (type === "color") return deltaEOK(a, b);
+	if (type === "dimension") {
+		const pa = toPx(a, remBase);
+		const pb = toPx(b, remBase);
+		return pa !== void 0 && pb !== void 0 ? Math.abs(pa - pb) : void 0;
+	}
+	if (type === "duration") {
+		const ms = (d) => d.unit === "s" ? d.value * 1e3 : d.value;
+		return Math.abs(ms(a) - ms(b));
+	}
+	if (typeof a === "number" && typeof b === "number") return Math.abs(a - b);
+	return canonicalize(a) === canonicalize(b) ? 0 : void 0;
+}
+/** Types a value can stand for: a bare number may be a font weight. */
+const COMPATIBLE = {
+	number: ["number", "fontWeight"],
+	fontWeight: ["fontWeight", "number"]
+};
+/**
+* Tokens nearest to a value in one context. Deprecated ones go last; among equally close tokens,
+* the ones that reference another token (semantic tokens, which follow themes) come before the
+* primitives that hold the value.
+*/
+function nearestTokens(graph, parsed, input, limit) {
+	const types = COMPATIBLE[parsed.type] ?? [parsed.type];
+	const out = [];
+	const depth = /* @__PURE__ */ new Map();
+	for (const token of graph.tokens({ type: types })) {
+		const value = graph.value(token.id, input);
+		if (value === void 0 || value === null) continue;
+		const d = valueDistance(token.type === parsed.type ? parsed.type : token.type, parsed.value, value);
+		if (d === void 0) continue;
+		const exact = parsed.type === "color" ? d < 1 : parsed.type === "dimension" ? d < .5 : d === 0;
+		const m = {
+			token,
+			value,
+			distance: Math.round(d * 100) / 100,
+			exact
+		};
+		out.push(m);
+		depth.set(m, graph.chain(token.id, input).length);
+	}
+	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || a.distance - b.distance || depth.get(b) - depth.get(a) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
+}
+//#endregion
+//#region ../dsgraph-core/dist/diagnostics.js
+/** Collects diagnostics, deduplicating identical entries. */
+var DiagnosticBag = class {
+	items = /* @__PURE__ */ new Map();
+	add(code, severity, message, loc) {
+		const d = loc ? {
+			code,
+			severity,
+			message,
+			loc
+		} : {
+			code,
+			severity,
+			message
+		};
+		const key = canonicalize(d);
+		if (!this.items.has(key)) this.items.set(key, d);
+	}
+	error(code, message, loc) {
+		this.add(code, "error", message, loc);
+	}
+	warn(code, message, loc) {
+		this.add(code, "warning", message, loc);
+	}
+	info(code, message, loc) {
+		this.add(code, "info", message, loc);
+	}
+	merge(other) {
+		for (const d of other.list()) this.add(d.code, d.severity, d.message, d.loc);
+	}
+	hasErrors() {
+		for (const d of this.items.values()) if (d.severity === "error") return true;
+		return false;
+	}
+	/** Sorted by file, pointer, code, message for deterministic output. */
+	list() {
+		return [...this.items.values()].sort((a, b) => (a.loc?.file ?? "").localeCompare(b.loc?.file ?? "") || (a.loc?.pointer ?? "").localeCompare(b.loc?.pointer ?? "") || a.code.localeCompare(b.code) || a.message.localeCompare(b.message));
+	}
+};
+//#endregion
+//#region ../dsgraph-core/dist/pointer.js
+/** JSON Pointer helpers (RFC 6901). */
+const escapeSegment = (s) => s.replace(/~/g, "~0").replace(/\//g, "~1");
+const unescapeSegment = (s) => s.replace(/~1/g, "/").replace(/~0/g, "~");
+function toPointer(segments) {
+	return segments.map((s) => `/${escapeSegment(String(s))}`).join("");
+}
+/** Parses `#/a/b`, `/a/b` or `#` into segments; returns null for invalid syntax. */
+function parsePointer(pointer) {
+	let p = pointer;
+	if (p.startsWith("#")) p = p.slice(1);
+	if (p === "") return [];
+	if (!p.startsWith("/")) return null;
+	return p.slice(1).split("/").map(unescapeSegment);
+}
+function getAt(value, segments) {
+	let cur = value;
+	for (const seg of segments) if (Array.isArray(cur)) {
+		if (!/^(0|[1-9]\d*)$/.test(seg)) return {
+			found: false,
+			value: void 0
+		};
+		const i = Number(seg);
+		if (i >= cur.length) return {
+			found: false,
+			value: void 0
+		};
+		cur = cur[i];
+	} else if (cur !== null && typeof cur === "object" && Object.hasOwn(cur, seg)) cur = cur[seg];
+	else return {
+		found: false,
+		value: void 0
+	};
+	return {
+		found: true,
+		value: cur
+	};
+}
+//#endregion
+//#region ../dsgraph-core/dist/resolver/system.js
+/** Wraps plain token files into a synthetic system with one set and no modifiers. */
+function systemFromDocuments(docs) {
+	return {
+		sets: /* @__PURE__ */ new Map([["default", docs]]),
+		modifiers: /* @__PURE__ */ new Map(),
+		order: [{
+			kind: "set",
+			name: "default"
+		}],
+		synthetic: true
+	};
+}
+const ACCEPTED_VERSIONS = /* @__PURE__ */ new Set([
+	"2025.10",
+	"2025-10-01",
+	"2025-11-01"
+]);
+function dirname$5(path) {
+	const i = path.lastIndexOf("/");
+	return i < 0 ? "" : path.slice(0, i);
+}
+function joinPath(base, rel) {
+	const parts = (base ? `${base}/${rel}` : rel).split("/");
+	const out = [];
+	for (const p of parts) {
+		if (p === "" || p === ".") continue;
+		if (p === "..") out.pop();
+		else out.push(p);
+	}
+	return out.join("/");
+}
+/**
+* Parses a resolver document (Resolver 2025.10). Tolerant of known inconsistencies in the
+* specification itself (version spelled as a date, `context` instead of `contexts`).
+*/
+async function systemFromResolver(tree, file, load, diag) {
+	const system = {
+		sets: /* @__PURE__ */ new Map(),
+		modifiers: /* @__PURE__ */ new Map(),
+		order: [],
+		synthetic: false,
+		file
+	};
+	const at = (pointer) => ({
+		file,
+		pointer
+	});
+	if (!isPlainObject(tree)) {
+		diag.error("resolver/invalid-document", "A resolver document must be a JSON object", at(""));
+		return system;
+	}
+	if (tree.version === void 0) diag.error("resolver/missing-version", "Resolver must declare \"version\"", at(""));
+	else if (!ACCEPTED_VERSIONS.has(String(tree.version))) diag.warn("resolver/unknown-version", `Unknown resolver version "${String(tree.version)}"`, at("/version"));
+	else if (tree.version !== "2025.10") diag.info("resolver/version-date", `Version "${String(tree.version)}" is read as 2025.10`, at("/version"));
+	const fileCache = /* @__PURE__ */ new Map();
+	const loadFile = async (path) => {
+		if (!fileCache.has(path)) fileCache.set(path, await load(path));
+		return fileCache.get(path);
+	};
+	const sourcesOf = async (items, pointer, allowSetRefs) => {
+		if (!Array.isArray(items)) {
+			diag.error("resolver/invalid-sources", "Sources must be an array", at(pointer));
+			return [];
+		}
+		const docs = [];
+		for (const [i, item] of items.entries()) {
+			const p = `${pointer}/${i}`;
+			if (!isPlainObject(item)) {
+				diag.error("resolver/invalid-source", "Each source must be a reference object or inline tokens", at(p));
+				continue;
+			}
+			if (typeof item.$ref !== "string") {
+				docs.push({
+					file: `${file}#${p}`,
+					tree: item
+				});
+				continue;
+			}
+			const { $ref, ...siblings } = item;
+			const ref = $ref;
+			if (ref.startsWith("#")) {
+				const segs = parsePointer(ref);
+				if (!segs) {
+					diag.error("resolver/invalid-pointer", `Malformed pointer "${ref}"`, at(p));
+					continue;
+				}
+				if (segs[0] === "modifiers" || segs[0] === "resolutionOrder") {
+					diag.error("resolver/invalid-pointer", `Sources must not reference "${ref}"`, at(p));
+					continue;
+				}
+				if (segs[0] === "sets" && segs.length === 2) {
+					if (!allowSetRefs) continue;
+					const set = isPlainObject(tree.sets) ? tree.sets[segs[1]] : void 0;
+					if (!isPlainObject(set)) diag.error("resolver/invalid-pointer", `Set "${segs[1]}" not found`, at(p));
+					else docs.push(...await sourcesOf(set.sources, toPointer([
+						"sets",
+						segs[1],
+						"sources"
+					]), false));
+					continue;
+				}
+				const found = getAt(tree, segs);
+				if (!found.found) diag.error("resolver/invalid-pointer", `"${ref}" not found`, at(p));
+				else docs.push({
+					file: `${file}#${toPointer(segs)}`,
+					tree: override(found.value, siblings)
+				});
+				continue;
+			}
+			if (/^[a-z]+:\/\//i.test(ref)) {
+				diag.warn("resolver/remote-unsupported", `Remote source "${ref}" is not loaded`, at(p));
+				continue;
+			}
+			const [filePart, fragment] = ref.split("#");
+			const path = joinPath(dirname$5(file), filePart);
+			let content;
+			try {
+				content = await loadFile(path);
+			} catch (e) {
+				diag.error("resolver/source-not-found", `Cannot load "${path}": ${e.message}`, at(p));
+				continue;
+			}
+			if (fragment !== void 0) {
+				const segs = parsePointer(fragment.startsWith("/") ? fragment : `/${fragment}`);
+				const found = segs ? getAt(content, segs) : {
+					found: false,
+					value: void 0
+				};
+				if (!found.found) {
+					diag.error("resolver/invalid-pointer", `"${ref}" not found`, at(p));
+					continue;
+				}
+				content = found.value;
+			}
+			docs.push({
+				file: fragment !== void 0 ? `${path}#${fragment}` : path,
+				tree: override(content, siblings)
+			});
+		}
+		return docs;
+	};
+	const defineSet = async (name, def, pointer) => {
+		if (!isPlainObject(def)) {
+			diag.error("resolver/invalid-set", `Set "${name}" must be an object`, at(pointer));
+			return;
+		}
+		system.sets.set(name, await sourcesOf(def.sources, `${pointer}/sources`, true));
+	};
+	const defineModifier = async (name, def, pointer) => {
+		if (!isPlainObject(def)) {
+			diag.error("resolver/invalid-modifier", `Modifier "${name}" must be an object`, at(pointer));
+			return;
+		}
+		let contexts = def.contexts;
+		let key = "contexts";
+		if (contexts === void 0 && def.context !== void 0) {
+			contexts = def.context;
+			key = "context";
+			diag.warn("resolver/context-typo", `Modifier "${name}" uses "context"; the property is "contexts"`, at(pointer));
+		}
+		if (!isPlainObject(contexts) || Object.keys(contexts).length === 0) {
+			diag.error("resolver/no-contexts", `Modifier "${name}" must declare at least one context`, at(pointer));
+			return;
+		}
+		if (Object.keys(contexts).length === 1) diag.warn("resolver/single-context", `Modifier "${name}" has a single context; use a set instead`, at(pointer));
+		const m = { contexts: /* @__PURE__ */ new Map() };
+		for (const [ctx, items] of Object.entries(contexts)) m.contexts.set(ctx, await sourcesOf(items, `${pointer}/${key}/${ctx}`, true));
+		if (def.default !== void 0) {
+			if (typeof def.default === "string" && m.contexts.has(def.default)) m.default = def.default;
+			else diag.error("resolver/invalid-default", `Default "${String(def.default)}" is not a context of "${name}"`, at(pointer));
+		}
+		if (typeof def.description === "string") m.description = def.description;
+		system.modifiers.set(name, m);
+	};
+	const setDefs = isPlainObject(tree.sets) ? tree.sets : {};
+	const modifierDefs = isPlainObject(tree.modifiers) ? tree.modifiers : {};
+	let order = tree.resolutionOrder;
+	if (!Array.isArray(order)) {
+		diag.error("resolver/missing-resolution-order", "Resolver must declare \"resolutionOrder\"", at(""));
+		order = [...Object.keys(setDefs).map((n) => ({ $ref: `#/sets/${n}` })), ...Object.keys(modifierDefs).map((n) => ({ $ref: `#/modifiers/${n}` }))];
+	}
+	const seen = /* @__PURE__ */ new Set();
+	for (const [i, item] of order.entries()) {
+		const p = `/resolutionOrder/${i}`;
+		if (!isPlainObject(item)) {
+			diag.error("resolver/invalid-order-item", "Resolution order items must be objects", at(p));
+			continue;
+		}
+		let kind;
+		let name;
+		if (typeof item.$ref === "string") {
+			const segs = parsePointer(item.$ref);
+			if (segs && segs.length === 2 && (segs[0] === "sets" || segs[0] === "modifiers")) {
+				kind = segs[0] === "sets" ? "set" : "modifier";
+				name = segs[1];
+				const defs = kind === "set" ? setDefs : modifierDefs;
+				if (!(name in defs)) {
+					diag.error("resolver/invalid-pointer", `"${item.$ref}" not found`, at(p));
+					continue;
+				}
+				if (kind === "set" && !system.sets.has(name)) await defineSet(name, defs[name], `/sets/${name}`);
+				if (kind === "modifier" && !system.modifiers.has(name)) await defineModifier(name, defs[name], `/modifiers/${name}`);
+			} else {
+				diag.error("resolver/invalid-pointer", `Resolution order must reference a set or modifier`, at(p));
+				continue;
+			}
+		} else if ((item.type === "set" || item.type === "modifier") && typeof item.name === "string") {
+			kind = item.type;
+			name = item.name;
+			if (kind === "set") await defineSet(name, item, p);
+			else await defineModifier(name, item, p);
+		} else {
+			diag.error("resolver/invalid-order-item", "Inline items need \"type\" (set | modifier) and \"name\"", at(p));
+			continue;
+		}
+		if (seen.has(name)) diag.error("resolver/duplicate-name", `"${name}" appears twice in resolutionOrder`, at(p));
+		seen.add(name);
+		system.order.push({
+			kind,
+			name
+		});
+	}
+	return system;
+}
+function override(value, siblings) {
+	if (Object.keys(siblings).length === 0 || !isPlainObject(value)) return value;
+	return {
+		...value,
+		...siblings
+	};
+}
+/** Modifiers in resolution order with contexts in declaration order. */
+function modifiersOf(system) {
+	const out = [];
+	for (const item of system.order) {
+		if (item.kind !== "modifier") continue;
+		const m = system.modifiers.get(item.name);
+		if (!m) continue;
+		const mod = {
+			name: item.name,
+			contexts: [...m.contexts.keys()]
+		};
+		if (m.default) mod.default = m.default;
+		out.push(mod);
+	}
+	return out;
+}
+/** Cartesian product of all modifier contexts, deterministic order. */
+function enumerateInputs(modifiers) {
+	let inputs = [{}];
+	for (const m of modifiers) inputs = inputs.flatMap((i) => m.contexts.map((c) => ({
+		...i,
+		[m.name]: c
+	})));
+	return inputs;
+}
+function defaultInput(modifiers, configured = {}) {
+	const input = {};
+	for (const m of modifiers) {
+		const c = configured[m.name];
+		input[m.name] = c !== void 0 && m.contexts.includes(c) ? c : m.default ?? m.contexts[0];
+	}
+	return input;
+}
+/** Documents for an input, in resolution order. */
+function selectDocuments(system, input) {
+	const docs = [];
+	for (const item of system.order) if (item.kind === "set") docs.push(...system.sets.get(item.name) ?? []);
+	else {
+		const m = system.modifiers.get(item.name);
+		const ctx = input[item.name];
+		if (m && ctx !== void 0) docs.push(...m.contexts.get(ctx) ?? []);
+	}
+	return docs;
+}
+//#endregion
 //#region ../dsgraph-core/dist/values/canonical.js
 const STANDARD_TYPES = /* @__PURE__ */ new Set([
 	"color",
@@ -8170,7 +8280,7 @@ const LINE_CAPS = /* @__PURE__ */ new Set([
 */
 function canonicalValue(type, raw, ctx) {
 	switch (type) {
-		case "color": return canonicalColor(raw, ctx);
+		case "color": return canonicalColor$1(raw, ctx);
 		case "dimension": return canonicalDimension(raw, ctx);
 		case "fontFamily": return fontFamily$1(raw, ctx);
 		case "fontWeight": return fontWeight$1(raw, ctx);
@@ -10019,6 +10129,90 @@ function push(map, key, value) {
 	else map.set(key, [value]);
 }
 //#endregion
+//#region ../dsgraph-core/dist/impact.js
+const BREAKS = /* @__PURE__ */ new Set([
+	"token.removed",
+	"token.renamed",
+	"token.missing-in-context",
+	"token.type-changed"
+]);
+const IGNORED = /* @__PURE__ */ new Set([
+	"token.added",
+	"token.notation-changed",
+	"token.description-changed",
+	"token.extensions-changed",
+	"token.undeprecated",
+	"token.contexts-changed",
+	"token.deprecated"
+]);
+/** Uses of each token in a graph, by token id. */
+function usesByToken(graph, code, prefix) {
+	const vars = new VarMatcher(graph, code.uses.map((u) => u.name), prefix);
+	const out = /* @__PURE__ */ new Map();
+	for (const u of code.uses) {
+		const t = vars.token(u.name);
+		if (t) out.set(t.id, [...out.get(t.id) ?? [], u]);
+	}
+	return out;
+}
+const siteKey = (s) => `${s.file}:${s.line}:${s.column}:${s.name}`;
+/**
+* Where a changeset reaches into the code (spec section 5.4): for every direct change, the `var()`
+* uses of the changed token and of every token that takes its value from it. Removed and renamed
+* tokens are followed in the base graph, where the code's names still point at them; the rest in
+* the head. Sorted by effect, then by how many places a change reaches.
+*/
+function impactOf(cs, base, head, code, opts = {}) {
+	const inBase = usesByToken(base, code, opts.prefix);
+	const inHead = usesByToken(head, code, opts.prefix);
+	const changes = [];
+	const broken = /* @__PURE__ */ new Set();
+	const different = /* @__PURE__ */ new Set();
+	const files = /* @__PURE__ */ new Set();
+	for (const c of cs.changes) {
+		if (c.origin !== "direct" || IGNORED.has(c.kind) || c.kind.startsWith("context.") || c.kind.startsWith("modifier.")) continue;
+		const gone = c.kind === "token.removed" || c.kind === "token.renamed";
+		const graph = gone ? base : head;
+		const index = gone ? inBase : inHead;
+		const root = c.kind === "token.renamed" ? c.from ?? c.target : c.target;
+		const reached = gone ? [root] : [root, ...graph.dependents(root, { transitive: true })];
+		const sites = [];
+		const seen = /* @__PURE__ */ new Set();
+		for (const id of reached) for (const u of index.get(id) ?? []) {
+			const k = siteKey(u);
+			if (seen.has(k)) continue;
+			seen.add(k);
+			sites.push({
+				...u,
+				token: id
+			});
+		}
+		if (sites.length === 0) continue;
+		const effect = BREAKS.has(c.kind) ? "breaks" : "changes";
+		for (const s of sites) {
+			(effect === "breaks" ? broken : different).add(siteKey(s));
+			files.add(s.file);
+		}
+		sites.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.column - b.column);
+		changes.push({
+			change: c.id,
+			kind: c.kind,
+			target: c.target,
+			level: c.level,
+			effect,
+			sites
+		});
+	}
+	for (const k of broken) different.delete(k);
+	changes.sort((a, b) => Number(a.effect === "changes") - Number(b.effect === "changes") || b.sites.length - a.sites.length || a.target.localeCompare(b.target));
+	return {
+		changes,
+		breaks: broken.size,
+		looksDifferent: different.size,
+		files: [...files].sort()
+	};
+}
+//#endregion
 //#region ../../node_modules/json5/lib/unicode.js
 var require_unicode = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	module.exports.Space_Separator = /[\u1680\u2000-\u200A\u202F\u205F\u3000]/;
@@ -10049,7 +10243,7 @@ var require_util$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../../node_modules/json5/lib/parse.js
-var require_parse$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_parse$2 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	const util = require_util$1();
 	let source;
 	let parseState;
@@ -10790,7 +10984,7 @@ var require_parse$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../../node_modules/json5/lib/stringify.js
-var require_stringify$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_stringify$2 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	const util = require_util$1();
 	module.exports = function stringify(value, replacer, space) {
 		const stack = [];
@@ -10958,8 +11152,8 @@ var require_stringify$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 //#region ../dsgraph-core/dist/json.js
 var import_lib = /* @__PURE__ */ __toESM((/* @__PURE__ */ __commonJSMin(((exports, module) => {
 	module.exports = {
-		parse: require_parse$1(),
-		stringify: require_stringify$1()
+		parse: require_parse$2(),
+		stringify: require_stringify$2()
 	};
 })))(), 1);
 /**
@@ -11016,6 +11210,13 @@ function stripJsonc(text) {
 	}
 	return out.replace(/,(\s*[}\]])/g, "$1");
 }
+//#endregion
+//#region ../dsgraph-core/dist/not-tokens.js
+/**
+* JSON files that are never token files, skipped when looking through all `*.json`.
+* A module of its own so that browser code can use it without pulling in the scanner.
+*/
+const NOT_TOKENS = /(^|\/)(package(-lock)?|tsconfig[\w.-]*|jsconfig|composer|lerna|nx|project|turbo|vercel|biome|renovate|manifest|\.?[\w-]*rc|[\w.-]*\.schema|([\w.-]*\.)?resolver|dsgraph\.config)\.json$/i;
 //#endregion
 //#region ../dsgraph-core/dist/resolver/modes.js
 const THEME_WORDS = /* @__PURE__ */ new Set(["light", "dark"]);
@@ -11232,7 +11433,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.2.0";
+const GENERATOR = "dsgraph@0.3.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -11425,7 +11626,7 @@ async function prefetch(source, paths, concurrency = 16) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/scan.js
-const DEFAULT_INCLUDE = ["**/*.tokens.json", "**/*.tokens"];
+const DEFAULT_INCLUDE$1 = ["**/*.tokens.json", "**/*.tokens"];
 const ALWAYS_EXCLUDE = ["**/node_modules/**", "**/.git/**"];
 const BUILD_OUTPUT = ["**/dist/**"];
 [...ALWAYS_EXCLUDE, ...BUILD_OUTPUT];
@@ -11442,8 +11643,6 @@ function excludeFor(config, section) {
 		...own?.exclude ?? []
 	];
 }
-/** JSON files that are never token files, skipped when looking through all `*.json`. */
-const NOT_TOKENS = /(^|\/)(package(-lock)?|tsconfig[\w.-]*|jsconfig|composer|lerna|nx|project|turbo|vercel|biome|renovate|manifest|\.?[\w-]*rc|[\w.-]*\.schema|[\w.-]*\.resolver|dsgraph\.config)\.json$/i;
 /**
 * Loads a token system. Precedence: a resolver document, then DTCG token files, then adapters.
 * When only `css` is configured, adapters come before DTCG files.
@@ -11485,7 +11684,7 @@ async function loadSystem(source, config, diag, opts = {}) {
 	}
 	const first = await fromAdapters("first");
 	if (first) return first;
-	let files = (await source.list(config.tokens?.include ?? DEFAULT_INCLUDE)).filter(notExcluded);
+	let files = (await source.list(config.tokens?.include ?? DEFAULT_INCLUDE$1)).filter(notExcluded);
 	if (files.length === 0 && !config.tokens?.include) {
 		const json = (await source.list(["**/*.json", "**/*.json5"])).filter((p) => notExcluded(p) && !NOT_TOKENS.test(p));
 		files = [];
@@ -11541,725 +11740,6 @@ async function scan(source, config = {}, opts = {}) {
 	if (config.contexts?.default) build.defaultInput = config.contexts.default;
 	if (config.contexts?.maxPermutations) build.maxPermutations = config.contexts.maxPermutations;
 	return buildSnapshot(system, build);
-}
-//#endregion
-//#region ../dsgraph-report/dist/values.js
-const isObj$2 = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
-const plain = (value) => typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value);
-/**
-* Short human-readable form of a canonical value. Never throws: a value that does not have the
-* shape of its type (a source error) is shown as it is.
-*/
-function formatValue(type, value) {
-	try {
-		return formatTyped(type, value);
-	} catch {
-		return plain(value);
-	}
-}
-function formatTyped(type, value) {
-	if (value === null || value === void 0) return "—";
-	switch (type) {
-		case "color": {
-			if (!isObj$2(value) || !Array.isArray(value.components)) return plain(value);
-			const c = value;
-			const hex = colorToHex(c);
-			const alpha = c.alpha < 1 ? ` ${Math.round(c.alpha * 100)}%` : "";
-			return c.space === "srgb" ? `${hex}${alpha}` : `${hex}${alpha} (${c.space})`;
-		}
-		case "dimension":
-		case "duration": {
-			const d = value;
-			return `${d.value}${d.unit}`;
-		}
-		case "fontFamily": return value.join(", ");
-		case "cubicBezier": return `cubic-bezier(${value.join(", ")})`;
-		case "shadow": return value.map((l) => [
-			l.inset ? "inset" : "",
-			...[
-				"offsetX",
-				"offsetY",
-				"blur",
-				"spread"
-			].map((k) => formatValue("dimension", l[k])),
-			formatValue("color", l.color)
-		].filter(Boolean).join(" ")).join(", ");
-		case "border": {
-			const b = value;
-			return `${formatValue("dimension", b.width)} ${typeof b.style === "string" ? b.style : "dashed"} ${formatValue("color", b.color)}`;
-		}
-		case "typography": {
-			const t = value;
-			return `${formatValue("fontWeight", t.fontWeight)} ${formatValue("dimension", t.fontSize)}/${t.lineHeight ?? "—"} ${formatValue("fontFamily", t.fontFamily)}`;
-		}
-		default: return plain(value);
-	}
-}
-/** Value of a changeset side (`{ raw, value }`) with the alias it came from, if any. */
-function formatSide(type, side) {
-	if (!isObj$2(side)) return formatValue(type, side);
-	return `${formatValue(type, side.value)}${typeof side.raw === "string" && /^\{[^{}]+\}$/.test(side.raw) ? ` ← ${side.raw}` : ""}`;
-}
-function formatDelta(delta) {
-	if (!delta) return "";
-	const parts = [];
-	if (typeof delta.deltaEOK === "number") parts.push(`ΔE ${delta.deltaEOK}`);
-	if (typeof delta.deltaAlpha === "number") parts.push(`α ${delta.deltaAlpha > 0 ? "+" : ""}${delta.deltaAlpha}`);
-	if (typeof delta.px === "number") parts.push(`${delta.px > 0 ? "+" : ""}${delta.px}px`);
-	if (typeof delta.ms === "number") parts.push(`${delta.ms > 0 ? "+" : ""}${delta.ms}ms`);
-	if (typeof delta.by === "number") parts.push(`${delta.by > 0 ? "+" : ""}${delta.by}`);
-	if (Array.isArray(delta.fields)) parts.push(`changed: ${delta.fields.join(", ")}`);
-	for (const [k, one] of [["layers", "layer"], ["stops", "stop"]]) {
-		const d = delta[k];
-		if (Array.isArray(d)) parts.push(`${d.length === 1 ? one : k} ${d.map((i) => Number(i) + 1).join(", ")}`);
-		else if (d !== void 0) parts.push(`${k}: ${String(d)}`);
-	}
-	if (delta.unit !== void 0) parts.push(`unit: ${String(delta.unit)}`);
-	return parts.join(", ");
-}
-function formatSource(s) {
-	if (s.kind === "npm") return `npm:${s.package}@${s.version}`;
-	if (s.kind === "github") return `github:${s.repo}@${s.ref}${s.commit ? ` (${s.commit.slice(0, 7)})` : ""}${s.path ? `/${s.path}` : ""}`;
-	if (s.path) return s.path;
-	return s.kind;
-}
-const formatWhen = (when) => when && Object.keys(when).length > 0 ? ` (${Object.entries(when).map(([k, v]) => `${k}: ${v}`).join(", ")})` : "";
-//#endregion
-//#region ../dsgraph-report/dist/changeset.js
-const LEVEL_TITLE = {
-	major: "Breaking (major)",
-	minor: "Minor",
-	patch: "Patch",
-	none: "No impact"
-};
-const typeOf = (c) => {
-	const side = c.after ?? c.before;
-	if (side && typeof side === "object" && "type" in side) return side.type ?? null;
-	return null;
-};
-/** One line describing a change; `type` comes from the head token when known. */
-function describe(c, types, code) {
-	const t = types.get(c.target) ?? typeOf(c);
-	const where = formatWhen(c.when);
-	switch (c.kind) {
-		case "token.added": return `added ${code(c.target)}`;
-		case "token.removed": {
-			const maybe = c.possibleRenames?.length ? ` — possibly renamed to ${c.possibleRenames.map(code).join(" or ")}` : "";
-			return `removed ${code(c.target)}${maybe}`;
-		}
-		case "token.renamed": return `renamed ${code(c.from ?? "?")} → ${code(c.target)}${c.confidence < .8 ? ` (likely, ${Math.round(c.confidence * 100)}%)` : ""}`;
-		case "token.value-changed": {
-			const delta = formatDelta(c.delta);
-			return `${code(c.target)}${where}: ${formatSide(t, c.before)} → ${formatSide(t, c.after)}${delta ? ` (${delta})` : ""}`;
-		}
-		case "token.notation-changed": return `${code(c.target)}${where}: same value, written differently`;
-		case "token.alias-retargeted": return `${code(c.target)}${where}: now ${formatSide(t, c.after)}, same value`;
-		case "token.type-changed": return `${code(c.target)}: type ${String(c.before)} → ${String(c.after)}`;
-		case "token.missing-in-context": return `${code(c.target)} is no longer defined${where}`;
-		case "token.contexts-changed": return `${code(c.target)}: depends on ${JSON.stringify(c.before)} → ${JSON.stringify(c.after)}`;
-		case "token.deprecated": {
-			const d = c.after;
-			return `deprecated ${code(c.target)}${d?.replacement ? ` — use ${code(d.replacement)}` : d?.reason ? ` — ${d.reason}` : ""}`;
-		}
-		case "token.undeprecated": return `no longer deprecated ${code(c.target)}`;
-		case "token.description-changed": return `${code(c.target)}: description changed`;
-		case "token.extensions-changed": return `${code(c.target)}: $extensions changed`;
-		case "group.extends-changed": return `group ${code(c.target)}: $extends ${String(c.before ?? "—")} → ${String(c.after ?? "—")}`;
-		case "context.added":
-		case "context.removed": return `${c.kind === "context.added" ? "added" : "removed"} context ${code(c.target)}`;
-		case "modifier.added":
-		case "modifier.removed": return `${c.kind === "modifier.added" ? "added" : "removed"} modifier ${code(c.target)}`;
-		default: return `${c.kind} ${code(c.target)}`;
-	}
-}
-/** Formats a changeset. Propagated value changes are listed under the direct change that caused them. */
-function formatChangeset(cs, opts = {}) {
-	const format = opts.format ?? "text";
-	if (format === "json") return `${JSON.stringify(cs, null, 2)}\n`;
-	const md = format === "markdown";
-	const code = (s) => md ? `\`${s}\`` : s;
-	const types = opts.types ?? /* @__PURE__ */ new Map();
-	const max = opts.maxPropagated ?? 5;
-	const propagatedBy = /* @__PURE__ */ new Map();
-	for (const c of cs.changes) for (const cause of c.cause) propagatedBy.set(cause, [...propagatedBy.get(cause) ?? [], c]);
-	const shown = cs.changes.filter((c) => !(c.origin === "propagated" && c.cause.length > 0));
-	const counts = cs.summary.counts;
-	const summary = [
-		counts.removed ? `${counts.removed} removed` : "",
-		counts.renamed ? `${counts.renamed} renamed` : "",
-		counts.changed ? `${counts.changed} changed${counts.propagated ? ` (+${counts.propagated} through references)` : ""}` : "",
-		counts.added ? `${counts.added} added` : "",
-		counts.deprecated ? `${counts.deprecated} deprecated` : ""
-	].filter(Boolean);
-	const lines = [];
-	const title = cs.changes.length === 0 ? "no changes" : `suggested bump: ${cs.summary.level}`;
-	if (md) {
-		lines.push(`## dsgraph diff — ${title}`, "");
-		lines.push(`${formatSource(cs.base.source)} → ${formatSource(cs.head.source)}`, "");
-		if (summary.length) lines.push(`**${summary.join(" · ")}**`, "");
-	} else {
-		lines.push(`dsgraph diff — ${title}`, `${formatSource(cs.base.source)} → ${formatSource(cs.head.source)}`);
-		if (summary.length) lines.push(summary.join(" · "));
-		lines.push("");
-	}
-	for (const level of [
-		"major",
-		"minor",
-		"patch",
-		"none"
-	]) {
-		const group = shown.filter((c) => c.level === level);
-		if (group.length === 0) continue;
-		const collapsible = md && (level === "patch" || level === "none");
-		if (collapsible) lines.push(`<details><summary>${LEVEL_TITLE[level]} (${group.length})</summary>`, "");
-		else lines.push(md ? `### ${LEVEL_TITLE[level]} (${group.length})` : `${LEVEL_TITLE[level]} (${group.length})`, "");
-		for (const c of group) {
-			lines.push(`${md ? "- " : "  "}${describe(c, types, code)}`);
-			const via = propagatedBy.get(c.id);
-			if (via?.length) {
-				const names = [...new Set(via.map((p) => p.target))];
-				const listed = names.slice(0, max).map(code).join(", ");
-				lines.push(`${md ? "  - " : "      "}affects ${listed}${names.length > max ? ` and ${names.length - max} more` : ""}`);
-			}
-		}
-		lines.push("");
-		if (collapsible) lines.push("</details>", "");
-	}
-	if (cs.contexts.partial) lines.push(md ? "> Some contexts were not fully compared (too many permutations)." : "Note: some contexts were not fully compared.", "");
-	return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
-}
-//#endregion
-//#region ../dsgraph-report/dist/findings.js
-const ICON = {
-	error: "✖",
-	warning: "▲",
-	info: "•"
-};
-const QUOTED = /"[^"]*"/g;
-/** What differs between repeated messages: quoted values and numbers (`steps 0 and 1`). */
-const VARIABLE = /"[^"]*"|\b\d+(?:\.\d+)?\b/g;
-const mask = (part) => part.startsWith("\"") ? "\"…\"" : "…";
-/** Groups repeated findings: same rule, same severity, same message up to quoted values and numbers. Order is kept. */
-function groupFindings(findings) {
-	const groups = /* @__PURE__ */ new Map();
-	for (const f of findings) {
-		const pattern = f.message.replace(VARIABLE, mask);
-		const key = `${f.severity}\u0000${f.rule}\u0000${pattern}`;
-		const g = groups.get(key);
-		if (g) g.findings.push(f);
-		else groups.set(key, {
-			rule: f.rule,
-			severity: f.severity,
-			pattern,
-			findings: [f]
-		});
-	}
-	for (const g of groups.values()) {
-		g.pattern = restoreShared(g.findings.map((f) => f.message));
-		const files = new Set(g.findings.map((f) => f.loc?.file));
-		const [file] = files;
-		if (files.size === 1 && file) g.file = file;
-	}
-	return [...groups.values()];
-}
-/** Masks only the values that differ between messages; a shared one stays (`use "px"`, `2025.10`). */
-function restoreShared(messages) {
-	const parts = messages.map((m) => m.match(VARIABLE) ?? []);
-	let i = 0;
-	return messages[0].replace(VARIABLE, (q) => {
-		const k = i++;
-		return parts.every((ps) => ps[k] === q) ? q : mask(q);
-	});
-}
-/** What tells one finding of a group from another: its token, else the quoted values of its message. */
-function findingLabel(f) {
-	return `${f.nodes[0] ?? f.message.match(QUOTED)?.join(" ") ?? f.message}${formatWhen(f.when)}`;
-}
-const summaryOf = (findings) => {
-	const counts = {
-		error: 0,
-		warning: 0,
-		info: 0
-	};
-	for (const f of findings) counts[f.severity]++;
-	return `${counts.error} errors · ${counts.warning} warnings · ${counts.info} info`;
-};
-const cell = (s) => s.replace(/\|/g, "\\|");
-function formatFindings(findings, opts = {}) {
-	const format = opts.format ?? "text";
-	if (format === "json") return `${JSON.stringify(findings, null, 2)}\n`;
-	const grouped = opts.group ?? true;
-	const md = format === "markdown";
-	if (findings.length === 0) return md ? "## dsgraph check — no findings\n" : "dsgraph check — no findings\n";
-	const summary = summaryOf(findings);
-	if (md) {
-		if (!grouped) return `## dsgraph check — ${summary}\n\n| | Rule | Finding | File |\n|---|---|---|---|\n${findings.map((f) => `| ${ICON[f.severity]} ${f.severity} | \`${f.rule}\` | ${cell(f.message)}${formatWhen(f.when)} | ${f.loc?.file ? `\`${f.loc.file}\`` : ""} |`).join("\n")}\n`;
-		const groups = groupFindings(findings);
-		const max = opts.maxListed ?? 50;
-		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(g.pattern)}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.file ? `\`${g.file}\`` : ""} |`);
-		const details = groups.filter((g) => g.findings.length > 1).map((g) => {
-			const items = g.findings.slice(0, max).map((f) => `- ${cell(f.message)}${formatWhen(f.when)}${f.nodes[0] ? ` — \`${f.nodes[0]}\`` : ""}`);
-			if (g.findings.length > max) items.push(`- … and ${g.findings.length - max} more`);
-			return `<details><summary>${ICON[g.severity]} <code>${g.rule}</code> — ${g.findings.length} × ${escapeHtml(g.pattern)}</summary>\n\n${items.join("\n")}\n\n</details>`;
-		});
-		return `## dsgraph check — ${summary}\n\n| | Rule | Count | Finding | File |\n|---|---|---|---|---|\n${rows.join("\n")}\n${details.length ? `\n${details.join("\n\n")}\n` : ""}`;
-	}
-	const line = (severity, rule, text) => `${ICON[severity]} ${severity.padEnd(7)} ${rule.padEnd(30)} ${text}`;
-	if (!grouped) return `dsgraph check — ${summary}\n\n${findings.map((f) => line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${f.loc.file})` : ""}`)).join("\n")}\n`;
-	const examples = opts.examples ?? 3;
-	const indent = " ".repeat(41);
-	const lines = [];
-	for (const g of groupFindings(findings)) {
-		const n = g.findings.length;
-		const file = g.file ? `  (${g.file})` : "";
-		if (n === 1) {
-			const f = g.findings[0];
-			lines.push(line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${f.loc.file})` : ""}`));
-			continue;
-		}
-		lines.push(line(g.severity, g.rule, `${n}× ${g.pattern}${file}`));
-		const labels = g.findings.slice(0, examples).map(findingLabel);
-		lines.push(`${indent}${labels.join(", ")}${n > examples ? `, … and ${n - examples} more` : ""}`);
-	}
-	return `dsgraph check — ${summary}\n\n${lines.join("\n")}\n`;
-}
-const escapeHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-//#endregion
-//#region ../dsgraph-rules/dist/presets.js
-/** Presets follow architecture patterns only — never specific design systems (neutrality principle). */
-const PRESETS = {
-	/** Sensible defaults; equal to the rules' default severities. */
-	recommended: {
-		"token/deprecated-reference": "warning",
-		"naming/normalized-collision": "warning",
-		"color/hex-mismatch": "warning",
-		"color/out-of-gamut": "info",
-		"palette/non-monotonic": "warning",
-		"palette/duplicate-stops": "warning"
-	},
-	/** Only what DTCG 2025.10 requires: legacy syntax and non-standard values become errors. */
-	"dtcg-strict": {
-		"dtcg/legacy-syntax": "error",
-		"dtcg/invalid-unit": "error",
-		"dtcg/invalid-font-weight": "error",
-		"dtcg/unknown-type": "error",
-		"dtcg/typography-missing-field": "error",
-		"tokens/non-json": "error"
-	},
-	/** Two layers: `core` holds raw values and aliases nothing; `semantic` references `core` directly. */
-	"two-layer": {
-		"layer/allowed-sources": ["warning", { allow: {
-			core: [],
-			semantic: ["core", "semantic"]
-		} }],
-		"layer/alias-depth": ["warning", {
-			layer: "semantic",
-			max: 0
-		}]
-	}
-};
-//#endregion
-//#region ../dsgraph-rules/dist/rules/layers.js
-/** Whole-value alias targets of a token across all its contexts. */
-function wholeTargets(graph, id) {
-	const t = graph.token(id);
-	if (!t) return [];
-	return [...new Set(t.values.flatMap((v) => v.refs.filter((r) => !r.property && !r.targetPath).map((r) => r.to)))];
-}
-const aliasDepth = {
-	id: "layer/alias-depth",
-	description: "Tokens of a layer reference tokens of the same layer deeper than allowed.",
-	defaultSeverity: "off",
-	run({ graph, options, report }) {
-		const layer = typeof options.layer === "string" ? options.layer : "semantic";
-		const max = typeof options.max === "number" ? options.max : 0;
-		const allow = (Array.isArray(options.allow) ? options.allow : []).filter((a) => typeof a === "string").map((a) => a.split("->").map((s) => s.trim()));
-		const allowed = (from, to) => allow.some(([f, t]) => matchPath(from, f) && matchPath(to, t));
-		const memo = /* @__PURE__ */ new Map();
-		const depth = (id, seen) => {
-			if (memo.has(id)) return memo.get(id);
-			let d = 0;
-			for (const to of wholeTargets(graph, id)) {
-				if (graph.token(to)?.layer !== layer || seen.has(to) || allowed(id, to)) continue;
-				d = Math.max(d, 1 + depth(to, /* @__PURE__ */ new Set([...seen, to])));
-			}
-			memo.set(id, d);
-			return d;
-		};
-		for (const t of graph.tokens({ layer })) {
-			const d = depth(t.id, /* @__PURE__ */ new Set([t.id]));
-			if (d > max) report({
-				message: `"${t.id}" goes through ${d} ${layer} alias${d > 1 ? "es" : ""} (max ${max})`,
-				nodes: [t.id, ...wholeTargets(graph, t.id)],
-				evidence: {
-					depth: d,
-					max,
-					chain: graph.chain(t.id)
-				},
-				token: t
-			});
-		}
-	}
-};
-const allowedSources = {
-	id: "layer/allowed-sources",
-	description: "Tokens of a layer reference only the layers allowed for it.",
-	defaultSeverity: "off",
-	run({ graph, options, report }) {
-		const allow = options.allow ?? {};
-		for (const [, from, to] of graph.edges("aliases")) {
-			const source = graph.token(from);
-			const target = graph.token(to);
-			const fromLayer = source?.layer;
-			if (!source || !target || !fromLayer || !(fromLayer in allow)) continue;
-			const permitted = Array.isArray(allow[fromLayer]) ? allow[fromLayer] : [];
-			if (!permitted.includes(target.layer ?? "")) report({
-				message: `"${from}" (${fromLayer}) references "${to}" (${target.layer ?? "no layer"}); ${fromLayer} may reference ${permitted.length ? permitted.join(", ") : "nothing"}`,
-				nodes: [from, to],
-				evidence: {
-					fromLayer,
-					toLayer: target.layer,
-					allowed: permitted
-				},
-				token: source
-			});
-		}
-	}
-};
-//#endregion
-//#region ../dsgraph-rules/dist/color.js
-const toRgb = converter("rgb");
-/** sRGB channels (0–1, clamped) and alpha of a canonical color value. */
-function rgba(c) {
-	const rgb = toRgb(toCulori(c));
-	const clamp = (v) => Math.min(1, Math.max(0, v ?? 0));
-	return [
-		clamp(rgb.r),
-		clamp(rgb.g),
-		clamp(rgb.b),
-		c.alpha
-	];
-}
-/** Composites `top` over an opaque `bottom`. */
-function over(top, bottom) {
-	return [
-		0,
-		1,
-		2
-	].map((i) => top[i] * top[3] + bottom[i] * (1 - top[3]));
-}
-function luminance([r, g, b]) {
-	const lin = (v) => v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4;
-	return .2126 * lin(r) + .7152 * lin(g) + .0722 * lin(b);
-}
-/** WCAG 2.x contrast ratio of text over a surface; translucent surfaces sit on white. */
-function contrastRatio(text, surface) {
-	const bg = over(rgba(surface), [
-		1,
-		1,
-		1
-	]);
-	const [l1, l2] = [luminance(over(rgba(text), bg)), luminance(bg)].sort((a, b) => b - a);
-	return (l1 + .05) / (l2 + .05);
-}
-//#endregion
-//#region ../dsgraph-rules/dist/rules/tokens.js
-const asArray = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
-const deprecatedReference = {
-	id: "token/deprecated-reference",
-	description: "A token references a deprecated token.",
-	defaultSeverity: "warning",
-	run({ graph, report }) {
-		for (const [, from, to] of graph.edges("aliases")) {
-			const source = graph.token(from);
-			const target = graph.token(to);
-			if (!source || !target?.deprecated || source.deprecated) continue;
-			const replacement = target.deprecated.replacement;
-			report({
-				message: `"${from}" references deprecated "${to}"${replacement ? `; use "${replacement}"` : ""}`,
-				nodes: [from, to],
-				evidence: {
-					reason: target.deprecated.reason,
-					replacement
-				},
-				token: source
-			});
-		}
-	}
-};
-const normalizedCollision = {
-	id: "naming/normalized-collision",
-	description: "Different tokens map to the same name in code (CSS, Figma) after normalization.",
-	defaultSeverity: "warning",
-	run({ graph, report }) {
-		const byName = /* @__PURE__ */ new Map();
-		for (const t of graph.tokens()) {
-			const n = normalizeName(t.id);
-			byName.set(n, [...byName.get(n) ?? [], t.id]);
-		}
-		for (const [name, ids] of byName) if (ids.length > 1) report({
-			message: `${ids.map((i) => `"${i}"`).join(", ")} all normalize to "${name}"`,
-			nodes: ids,
-			evidence: { name }
-		});
-	}
-};
-const hexMismatch = {
-	id: "color/hex-mismatch",
-	description: "The hex fallback of a color does not match its components.",
-	defaultSeverity: "warning",
-	run({ graph, report }) {
-		for (const t of graph.tokens({ type: "color" })) for (const v of t.values) {
-			const c = v.value;
-			if (!c?.hex) continue;
-			const actual = colorToHex(c);
-			if ([
-				1,
-				3,
-				5
-			].some((i) => Math.abs(Number.parseInt(actual.slice(i, i + 2), 16) - Number.parseInt(c.hex.slice(i, i + 2), 16)) > 1)) report({
-				message: `"${t.id}": hex ${c.hex} does not match the color (${actual})`,
-				nodes: [t.id],
-				evidence: {
-					hex: c.hex,
-					computed: actual
-				},
-				when: v.when,
-				token: t
-			});
-		}
-	}
-};
-const outOfGamut = {
-	id: "color/out-of-gamut",
-	description: "A wide-gamut color is outside sRGB and has no hex fallback.",
-	defaultSeverity: "info",
-	run({ graph, report }) {
-		for (const t of graph.tokens({ type: "color" })) for (const v of t.values) {
-			const c = v.value;
-			if (c && !c.hex && !isInSrgbGamut(c)) report({
-				message: `"${t.id}" is outside sRGB; add a hex fallback for sRGB targets`,
-				nodes: [t.id],
-				evidence: { space: c.space },
-				when: v.when,
-				token: t
-			});
-		}
-	}
-};
-/** Color ramps: siblings whose last name segment is a number (`blue.100`, `blue-500`), at least 3 stops. */
-function ramps(graph) {
-	const groups = /* @__PURE__ */ new Map();
-	for (const t of graph.tokens({ type: "color" })) {
-		const segs = normalizeName(t.id).split(".");
-		const step = Number(segs.at(-1));
-		if (segs.length < 2 || !/^\d+$/.test(segs.at(-1)) || !Number.isFinite(step)) continue;
-		const key = segs.slice(0, -1).join(".");
-		groups.set(key, [...groups.get(key) ?? [], {
-			id: t.id,
-			step
-		}]);
-	}
-	return [...groups].filter(([, stops]) => stops.length >= 3).map(([name, stops]) => ({
-		name,
-		stops: stops.sort((a, b) => a.step - b.step)
-	}));
-}
-//#endregion
-//#region ../dsgraph-rules/dist/check.js
-const RULES = [
-	deprecatedReference,
-	normalizedCollision,
-	hexMismatch,
-	outOfGamut,
-	{
-		id: "palette/non-monotonic",
-		description: "Lightness of a numeric color ramp does not change in one direction.",
-		defaultSeverity: "warning",
-		run({ graph, report }) {
-			for (const { name, stops } of ramps(graph)) {
-				const l = stops.map((s) => {
-					const v = graph.value(s.id);
-					return v ? toOklab(v)[0] : NaN;
-				});
-				const dir = Math.sign(l.at(-1) - l[0]);
-				for (let i = 1; i < stops.length; i++) {
-					const step = l[i] - l[i - 1];
-					if (Number.isNaN(step) || Math.abs(step) < 1e-4) continue;
-					if (Math.sign(step) !== dir) report({
-						message: `Ramp "${name}": lightness goes the wrong way from ${stops[i - 1].step} to ${stops[i].step}`,
-						nodes: [stops[i - 1].id, stops[i].id],
-						evidence: {
-							ramp: name,
-							from: Math.round(l[i - 1] * 1e3) / 1e3,
-							to: Math.round(l[i] * 1e3) / 1e3
-						}
-					});
-				}
-			}
-		}
-	},
-	{
-		id: "palette/duplicate-stops",
-		description: "Two steps of a numeric color ramp have the same color.",
-		defaultSeverity: "warning",
-		run({ graph, report }) {
-			for (const { name, stops } of ramps(graph)) for (let i = 1; i < stops.length; i++) {
-				const a = graph.value(stops[i - 1].id);
-				const b = graph.value(stops[i].id);
-				if (a && b && compareValues("color", a, b).result !== "changed") report({
-					message: `Ramp "${name}": steps ${stops[i - 1].step} and ${stops[i].step} are the same color`,
-					nodes: [stops[i - 1].id, stops[i].id],
-					evidence: { ramp: name }
-				});
-			}
-		}
-	},
-	{
-		id: "a11y/contrast-matrix",
-		description: "Every text role over every surface role meets the minimum WCAG contrast in every context.",
-		defaultSeverity: "off",
-		run({ graph, options, report }) {
-			const text = asArray(options.text);
-			const surfaces = asArray(options.surfaces);
-			const min = typeof options.min === "number" ? options.min : 4.5;
-			const acknowledged = new Set(asArray(options.acknowledged));
-			if (text.length === 0 || surfaces.length === 0) return;
-			const textTokens = graph.tokens({ type: "color" }).filter((t) => text.some((p) => matchPath(t.id, p)));
-			const surfaceTokens = graph.tokens({ type: "color" }).filter((t) => surfaces.some((p) => matchPath(t.id, p)));
-			const inputs = graph.inputs().slice(0, 64);
-			for (const fg of textTokens) for (const bg of surfaceTokens) {
-				if (fg.id === bg.id) continue;
-				const failing = /* @__PURE__ */ new Map();
-				for (const input of inputs) {
-					const f = graph.value(fg.id, input);
-					const b = graph.value(bg.id, input);
-					if (!f || !b) continue;
-					const ratio = Math.round(contrastRatio(f, b) * 100) / 100;
-					if (ratio < min) failing.set(JSON.stringify(input), {
-						when: input,
-						ratio
-					});
-				}
-				if (failing.size === 0) continue;
-				const pair = `${fg.id} × ${bg.id}`;
-				const worst = [...failing.values()].sort((a, b) => a.ratio - b.ratio)[0];
-				const all = failing.size === inputs.length;
-				const finding = {
-					message: `${pair}: contrast ${worst.ratio} is below ${min}${all ? "" : ` in ${failing.size} of ${inputs.length} contexts`}`,
-					nodes: [fg.id, bg.id],
-					evidence: {
-						ratio: worst.ratio,
-						min,
-						contexts: [...failing.values()].map((f) => f.when)
-					},
-					...all ? {} : { when: worst.when }
-				};
-				report(acknowledged.has(pair) ? {
-					...finding,
-					severity: "info",
-					message: `${finding.message} (acknowledged)`
-				} : finding);
-			}
-		}
-	},
-	aliasDepth,
-	allowedSources
-];
-const RANK$1 = {
-	error: 3,
-	warning: 2,
-	info: 1
-};
-/** Rule defaults → presets from `extends` (in order) → `rules` from the config. */
-function resolveSettings(config, rules = RULES) {
-	const settings = /* @__PURE__ */ new Map();
-	for (const r of rules) settings.set(r.id, {
-		severity: r.defaultSeverity,
-		options: {}
-	});
-	const apply = (entries) => {
-		for (const [id, value] of Object.entries(entries)) {
-			const prev = settings.get(id) ?? {
-				severity: "warning",
-				options: {}
-			};
-			if (Array.isArray(value)) settings.set(id, {
-				severity: value[0],
-				options: {
-					...prev.options,
-					...value[1]
-				}
-			});
-			else settings.set(id, {
-				...prev,
-				severity: value
-			});
-		}
-	};
-	for (const name of config.extends ?? ["recommended"]) {
-		const preset = PRESETS[name];
-		if (!preset) throw new Error(`Unknown preset "${name}". Available: ${Object.keys(PRESETS).join(", ")}`);
-		apply(preset);
-	}
-	apply(config.rules ?? {});
-	return settings;
-}
-/**
-* Runs the rules over a graph. Parse diagnostics of the snapshot are reported as findings too;
-* their severity can be overridden (or turned off) by code in `rules`.
-*/
-async function check(graph, config = {}, extraRules = []) {
-	const rules = [...RULES, ...extraRules];
-	const settings = resolveSettings(config, rules);
-	const drafts = [];
-	const byOrigin = /* @__PURE__ */ new Map();
-	for (const t of graph.tokens()) byOrigin.set(`${t.origin.file}#${t.origin.pointer}`, t.id);
-	for (const d of graph.snapshot.diagnostics) {
-		const severity = settings.get(d.code)?.severity ?? d.severity;
-		if (severity === "off") continue;
-		const node = d.loc ? byOrigin.get(`${d.loc.file}#${d.loc.pointer}`) : void 0;
-		const f = {
-			rule: d.code,
-			severity,
-			message: d.message,
-			nodes: node ? [node] : []
-		};
-		if (d.loc) f.loc = d.loc;
-		drafts.push(f);
-	}
-	for (const rule of rules) {
-		const setting = settings.get(rule.id);
-		if (setting.severity === "off") continue;
-		const ctx = {
-			graph,
-			options: setting.options,
-			config,
-			report(r) {
-				const f = {
-					rule: rule.id,
-					severity: r.severity && RANK$1[r.severity] < RANK$1[setting.severity] ? r.severity : setting.severity,
-					message: r.message,
-					nodes: r.nodes
-				};
-				if (r.evidence) f.evidence = r.evidence;
-				if (r.when) f.when = r.when;
-				if (r.token) f.loc = r.token.origin;
-				drafts.push(f);
-			}
-		};
-		rule.run(ctx);
-	}
-	const findings = [];
-	for (const d of drafts) findings.push({
-		id: `${d.rule}#${(await sha256Hex(canonicalize({
-			n: d.nodes,
-			w: d.when,
-			m: d.message
-		}))).slice(0, 12)}`,
-		...d
-	});
-	return findings.sort((a, b) => RANK$1[b.severity] - RANK$1[a.severity] || a.rule.localeCompare(b.rule) || a.message.localeCompare(b.message));
 }
 //#endregion
 //#region ../../node_modules/picocolors/picocolors.js
@@ -12333,7 +11813,7 @@ var require_picocolors = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/tokenize.js
-var require_tokenize = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_tokenize$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	const SINGLE_QUOTE = "'".charCodeAt(0);
 	const DOUBLE_QUOTE = "\"".charCodeAt(0);
 	const BACKSLASH = "\\".charCodeAt(0);
@@ -12570,9 +12050,9 @@ var require_tokenize = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/terminal-highlight.js
-var require_terminal_highlight = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_terminal_highlight$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let pico = require_picocolors();
-	let tokenizer = require_tokenize();
+	let tokenizer = require_tokenize$1();
 	let Input;
 	function registerInput(dependant) {
 		Input = dependant;
@@ -12622,9 +12102,9 @@ var require_terminal_highlight = /* @__PURE__ */ __commonJSMin(((exports, module
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/css-syntax-error.js
-var require_css_syntax_error = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_css_syntax_error$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let pico = require_picocolors();
-	let terminalHighlight = require_terminal_highlight();
+	let terminalHighlight = require_terminal_highlight$1();
 	var CssSyntaxError = class CssSyntaxError extends Error {
 		constructor(message, line, column, source, file, plugin) {
 			super(message);
@@ -12699,7 +12179,7 @@ var require_css_syntax_error = /* @__PURE__ */ __commonJSMin(((exports, module) 
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/stringifier.js
-var require_stringifier = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_stringifier$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	const STYLE_TAG = /(<)(\/?style\b)/gi;
 	const COMMENT_OPEN = /(<)(!--)/g;
 	const AT_NAME_END = /[\t\n\f\r "#'()/;[\\\]{}]/;
@@ -13025,8 +12505,8 @@ var require_stringifier = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/stringify.js
-var require_stringify = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Stringifier = require_stringifier();
+var require_stringify$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Stringifier = require_stringifier$1();
 	function stringify(node, builder) {
 		new Stringifier(builder).stringify(node);
 	}
@@ -13035,17 +12515,17 @@ var require_stringify = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/symbols.js
-var require_symbols = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_symbols$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	module.exports.isClean = Symbol("isClean");
 	module.exports.my = Symbol("my");
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/node.js
-var require_node = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let CssSyntaxError = require_css_syntax_error();
-	let Stringifier = require_stringifier();
-	let stringify = require_stringify();
-	let { isClean, my } = require_symbols();
+var require_node$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let CssSyntaxError = require_css_syntax_error$1();
+	let Stringifier = require_stringifier$1();
+	let stringify = require_stringify$1();
+	let { isClean, my } = require_symbols$1();
 	function cloneNode(obj, parent) {
 		let cloned = new obj.constructor();
 		let stack = [[
@@ -13403,8 +12883,8 @@ var require_node = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/comment.js
-var require_comment = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Node = require_node();
+var require_comment$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Node = require_node$1();
 	var Comment = class extends Node {
 		constructor(defaults) {
 			super(defaults);
@@ -13416,8 +12896,8 @@ var require_comment = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/declaration.js
-var require_declaration = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Node = require_node();
+var require_declaration$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Node = require_node$1();
 	var Declaration = class extends Node {
 		get variable() {
 			return this.prop.startsWith("--") || this.prop[0] === "$";
@@ -13436,11 +12916,11 @@ var require_declaration = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/container.js
-var require_container = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Comment = require_comment();
-	let Declaration = require_declaration();
-	let Node = require_node();
-	let { isClean, my } = require_symbols();
+var require_container$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Comment = require_comment$1();
+	let Declaration = require_declaration$1();
+	let Node = require_node$1();
+	let { isClean, my } = require_symbols$1();
 	let AtRule;
 	let parse;
 	let Root;
@@ -13772,8 +13252,8 @@ var require_container = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 /* c8 ignore stop */
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/at-rule.js
-var require_at_rule = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Container = require_container();
+var require_at_rule$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
 	var AtRule = class extends Container {
 		constructor(defaults) {
 			super(defaults);
@@ -13794,8 +13274,8 @@ var require_at_rule = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/document.js
-var require_document = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Container = require_container();
+var require_document$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
 	let LazyResult;
 	let Processor;
 	var Document = class extends Container {
@@ -15980,13 +15460,13 @@ var require_source_map = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/previous-map.js
-var require_previous_map = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let { existsSync, readFileSync, realpathSync } = __require("fs");
-	let { dirname: dirname$2, isAbsolute: isAbsolute$1, join: join$1, relative: relative$2, sep: sep$2 } = __require("path");
+var require_previous_map$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { existsSync: existsSync$1, readFileSync: readFileSync$1, realpathSync: realpathSync$1 } = __require("fs");
+	let { dirname: dirname$4, isAbsolute: isAbsolute$3, join: join$2, relative: relative$4, sep: sep$4 } = __require("path");
 	let { SourceMapConsumer, SourceMapGenerator } = require_source_map();
 	function realPath(path) {
 		try {
-			return realpathSync(path);
+			return realpathSync$1(path);
 		} catch {
 			return path;
 		}
@@ -16006,7 +15486,7 @@ var require_previous_map = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			let prev = opts.map ? opts.map.prev : void 0;
 			let text = this.loadMap(opts.from, prev);
 			if (!this.mapFile && opts.from) this.mapFile = opts.from;
-			if (this.mapFile) this.root = dirname$2(this.mapFile);
+			if (this.mapFile) this.root = dirname$4(this.mapFile);
 			if (text) this.text = text;
 		}
 		consumer() {
@@ -16042,13 +15522,13 @@ var require_previous_map = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			if (!trusted && !this.unsafeMap) {
 				if (!/\.map$/i.test(path)) return void 0;
 				if (!cssFile) return void 0;
-				let rel = relative$2(realPath(dirname$2(cssFile)), realPath(path));
-				if (rel === ".." || rel.startsWith(".." + sep$2) || isAbsolute$1(rel)) return;
+				let rel = relative$4(realPath(dirname$4(cssFile)), realPath(path));
+				if (rel === ".." || rel.startsWith(".." + sep$4) || isAbsolute$3(rel)) return;
 			}
-			this.root = dirname$2(path);
-			if (existsSync(path)) {
+			this.root = dirname$4(path);
+			if (existsSync$1(path)) {
 				this.mapFile = path;
-				return readFileSync(path, "utf-8").toString().trim();
+				return readFileSync$1(path, "utf-8").toString().trim();
 			}
 		}
 		loadMap(file, prev) {
@@ -16069,7 +15549,7 @@ var require_previous_map = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			} else if (this.inline) return this.decodeInline(this.annotation);
 			else if (this.annotation) {
 				let map = this.annotation;
-				if (file) map = join$1(dirname$2(file), map);
+				if (file) map = join$2(dirname$4(file), map);
 				let unknown = this.loadFile(map, file, false);
 				if (unknown) try {
 					/* c8 ignore next 4 */
@@ -16093,17 +15573,17 @@ var require_previous_map = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/input.js
-var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_input$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let { nanoid } = require_non_secure();
-	let { isAbsolute, resolve: resolve$2 } = __require("path");
+	let { isAbsolute: isAbsolute$2, resolve: resolve$4 } = __require("path");
 	let { SourceMapConsumer, SourceMapGenerator } = require_source_map();
-	let { fileURLToPath, pathToFileURL: pathToFileURL$1 } = __require("url");
-	let CssSyntaxError = require_css_syntax_error();
-	let PreviousMap = require_previous_map();
-	let terminalHighlight = require_terminal_highlight();
+	let { fileURLToPath: fileURLToPath$1, pathToFileURL: pathToFileURL$3 } = __require("url");
+	let CssSyntaxError = require_css_syntax_error$1();
+	let PreviousMap = require_previous_map$1();
+	let terminalHighlight = require_terminal_highlight$1();
 	let lineToIndexCache = Symbol("lineToIndexCache");
 	let sourceMapAvailable = Boolean(SourceMapConsumer && SourceMapGenerator);
-	let pathAvailable = Boolean(resolve$2 && isAbsolute);
+	let pathAvailable = Boolean(resolve$4 && isAbsolute$2);
 	function getLineToIndex(input) {
 		if (input[lineToIndexCache]) return input[lineToIndexCache];
 		let lines = input.css.split("\n");
@@ -16130,8 +15610,8 @@ var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 			this.document = this.css;
 			if (opts.document) this.document = opts.document.toString();
 			if (opts.from) {
-				if (!pathAvailable || /^\w+:\/\//.test(opts.from) || isAbsolute(opts.from)) this.file = opts.from;
-				else this.file = resolve$2(opts.from);
+				if (!pathAvailable || /^\w+:\/\//.test(opts.from) || isAbsolute$2(opts.from)) this.file = opts.from;
+				else this.file = resolve$4(opts.from);
 			}
 			if (pathAvailable && sourceMapAvailable) {
 				let map = new PreviousMap(this.css, opts);
@@ -16200,7 +15680,7 @@ var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 				source: this.css
 			};
 			if (this.file) {
-				if (pathToFileURL$1) result.input.url = pathToFileURL$1(this.file).toString();
+				if (pathToFileURL$3) result.input.url = pathToFileURL$3(this.file).toString();
 				result.input.file = this.file;
 			}
 			return result;
@@ -16233,7 +15713,7 @@ var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		}
 		mapResolve(file) {
 			if (/^\w+:\/\//.test(file)) return file;
-			return resolve$2(this.map.consumer().sourceRoot || this.map.root || ".", file);
+			return resolve$4(this.map.consumer().sourceRoot || this.map.root || ".", file);
 		}
 		origin(line, column, endLine, endColumn) {
 			if (!this.map) return false;
@@ -16252,8 +15732,8 @@ var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 				if (toPosition.source) to = toPosition;
 			}
 			let fromUrl;
-			if (isAbsolute(from.source)) fromUrl = pathToFileURL$1(from.source);
-			else fromUrl = new URL(from.source, this.map.consumer().sourceRoot || pathToFileURL$1(this.map.mapFile));
+			if (isAbsolute$2(from.source)) fromUrl = pathToFileURL$3(from.source);
+			else fromUrl = new URL(from.source, this.map.consumer().sourceRoot || pathToFileURL$3(this.map.mapFile));
 			let result = {
 				column: from.column + 1,
 				endColumn: to && to.column + 1,
@@ -16262,7 +15742,7 @@ var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 				url: fromUrl.toString()
 			};
 			if (fromUrl.protocol === "file:") {
-				if (fileURLToPath) result.file = fileURLToPath(fromUrl);
+				if (fileURLToPath$1) result.file = fileURLToPath$1(fromUrl);
 				else
  /* c8 ignore next 2 */
 				throw new Error(`file: protocol is not available in this PostCSS build`);
@@ -16292,8 +15772,8 @@ var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/root.js
-var require_root = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Container = require_container();
+var require_root$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
 	let LazyResult;
 	let Processor;
 	var Root = class extends Container {
@@ -16337,7 +15817,7 @@ var require_root = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/list.js
-var require_list = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+var require_list$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let list = {
 		comma(string) {
 			return list.split(string, [","], true);
@@ -16389,9 +15869,9 @@ var require_list = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/rule.js
-var require_rule = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let Container = require_container();
-	let list = require_list();
+var require_rule$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
+	let list = require_list$1();
 	var Rule = class extends Container {
 		get selectors() {
 			return list.comma(this.selector);
@@ -16413,14 +15893,14 @@ var require_rule = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/fromJSON.js
-var require_fromJSON = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let AtRule = require_at_rule();
-	let Comment = require_comment();
-	let Declaration = require_declaration();
-	let Input = require_input();
-	let PreviousMap = require_previous_map();
-	let Root = require_root();
-	let Rule = require_rule();
+var require_fromJSON$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let AtRule = require_at_rule$1();
+	let Comment = require_comment$1();
+	let Declaration = require_declaration$1();
+	let Input = require_input$1();
+	let PreviousMap = require_previous_map$1();
+	let Root = require_root$1();
+	let Rule = require_rule$1();
 	function hydrateInputs(json, inputs) {
 		if (!json.inputs) return inputs;
 		return json.inputs.map((input) => {
@@ -16492,13 +15972,13 @@ var require_fromJSON = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/map-generator.js
-var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let { dirname: dirname$1, relative: relative$1, resolve: resolve$1, sep: sep$1 } = __require("path");
+var require_map_generator$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { dirname: dirname$3, relative: relative$3, resolve: resolve$3, sep: sep$3 } = __require("path");
 	let { SourceMapConsumer, SourceMapGenerator } = require_source_map();
-	let { pathToFileURL } = __require("url");
-	let Input = require_input();
+	let { pathToFileURL: pathToFileURL$2 } = __require("url");
+	let Input = require_input$1();
 	let sourceMapAvailable = Boolean(SourceMapConsumer && SourceMapGenerator);
-	let pathAvailable = Boolean(dirname$1 && resolve$1 && relative$1 && sep$1);
+	let pathAvailable = Boolean(dirname$3 && resolve$3 && relative$3 && sep$3);
 	var MapGenerator = class {
 		constructor(stringify, root, opts, cssString) {
 			this.stringify = stringify;
@@ -16525,7 +16005,7 @@ var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 		applyPrevMaps() {
 			for (let prev of this.previous()) {
 				let from = this.toUrl(this.path(prev.file));
-				let root = prev.root || dirname$1(prev.file);
+				let root = prev.root || dirname$3(prev.file);
 				let map;
 				if (this.mapOpts.sourcesContent === false) {
 					map = new SourceMapConsumer(prev.text);
@@ -16693,9 +16173,9 @@ var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 			if (/^\w+:\/\//.test(file)) return file;
 			let cached = this.memoizedPaths.get(file);
 			if (cached) return cached;
-			let from = this.opts.to ? dirname$1(this.opts.to) : ".";
-			if (typeof this.mapOpts.annotation === "string") from = dirname$1(resolve$1(from, this.mapOpts.annotation));
-			let path = relative$1(from, file);
+			let from = this.opts.to ? dirname$3(this.opts.to) : ".";
+			if (typeof this.mapOpts.annotation === "string") from = dirname$3(resolve$3(from, this.mapOpts.annotation));
+			let path = relative$3(from, file);
 			this.memoizedPaths.set(file, path);
 			return path;
 		}
@@ -16744,8 +16224,8 @@ var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 		toFileUrl(path) {
 			let cached = this.memoizedFileURLs.get(path);
 			if (cached) return cached;
-			if (pathToFileURL) {
-				let fileURL = pathToFileURL(path).toString();
+			if (pathToFileURL$2) {
+				let fileURL = pathToFileURL$2(path).toString();
 				this.memoizedFileURLs.set(path, fileURL);
 				return fileURL;
 			} else throw new Error("`map.absolute` option is not available in this PostCSS build");
@@ -16753,7 +16233,7 @@ var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 		toUrl(path) {
 			let cached = this.memoizedURLs.get(path);
 			if (cached) return cached;
-			if (sep$1 === "\\") path = path.replace(/\\/g, "/");
+			if (sep$3 === "\\") path = path.replace(/\\/g, "/");
 			let url = encodeURI(path).replace(/[#?]/g, encodeURIComponent);
 			this.memoizedURLs.set(path, url);
 			return url;
@@ -16763,13 +16243,13 @@ var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => 
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/parser.js
-var require_parser = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	let AtRule = require_at_rule();
-	let Comment = require_comment();
-	let Declaration = require_declaration();
-	let Root = require_root();
-	let Rule = require_rule();
-	let tokenizer = require_tokenize();
+var require_parser$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let AtRule = require_at_rule$1();
+	let Comment = require_comment$1();
+	let Declaration = require_declaration$1();
+	let Root = require_root$1();
+	let Rule = require_rule$1();
+	let tokenizer = require_tokenize$1();
 	const SAFE_COMMENT_NEIGHBOR = {
 		empty: true,
 		space: true
@@ -17225,6 +16705,4506 @@ var require_parser = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 }));
 //#endregion
 //#region ../dsgraph-adapters/node_modules/postcss/lib/parse.js
+var require_parse$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
+	let Input = require_input$1();
+	let Parser = require_parser$1();
+	function parse(css, opts) {
+		let input = new Input(css, opts);
+		let parser = new Parser(input);
+		try {
+			parser.parse();
+		} catch (e) {
+			if (process.env.NODE_ENV !== "production") {
+				if (e.name === "CssSyntaxError" && opts && opts.from) {
+					if (/\.scss$/i.test(opts.from)) e.message += "\nYou tried to parse SCSS with the standard CSS parser; try again with the postcss-scss parser";
+					else if (/\.sass/i.test(opts.from)) e.message += "\nYou tried to parse Sass with the standard CSS parser; try again with the postcss-sass parser";
+					else if (/\.less$/i.test(opts.from)) e.message += "\nYou tried to parse Less with the standard CSS parser; try again with the postcss-less parser";
+				}
+			}
+			throw e;
+		}
+		return parser.root;
+	}
+	module.exports = parse;
+	parse.default = parse;
+	Container.registerParse(parse);
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/warning.js
+var require_warning$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
+	let { my } = require_symbols$1();
+	var Warning = class {
+		constructor(text, opts = {}) {
+			this.type = "warning";
+			this.text = text;
+			if (opts.node && opts.node.source) {
+				if (!opts.node[my]) Container.rebuild(opts.node);
+				let range = opts.node.rangeBy(opts);
+				this.line = range.start.line;
+				this.column = range.start.column;
+				this.endLine = range.end.line;
+				this.endColumn = range.end.column;
+			}
+			for (let opt in opts) this[opt] = opts[opt];
+		}
+		toString() {
+			if (this.node) return this.node.error(this.text, {
+				index: this.index,
+				plugin: this.plugin,
+				word: this.word
+			}).message;
+			if (this.plugin) return this.plugin + ": " + this.text;
+			return this.text;
+		}
+	};
+	module.exports = Warning;
+	Warning.default = Warning;
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/result.js
+var require_result$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Warning = require_warning$1();
+	var Result = class {
+		get content() {
+			return this.css;
+		}
+		constructor(processor, root, opts) {
+			this.processor = processor;
+			this.messages = [];
+			this.root = root;
+			this.opts = opts;
+			this.css = "";
+			this.map = void 0;
+		}
+		toString() {
+			return this.css;
+		}
+		warn(text, opts = {}) {
+			if (!opts.plugin) {
+				if (this.lastPlugin && this.lastPlugin.postcssPlugin) opts.plugin = this.lastPlugin.postcssPlugin;
+			}
+			let warning = new Warning(text, opts);
+			this.messages.push(warning);
+			return warning;
+		}
+		warnings() {
+			return this.messages.filter((i) => i.type === "warning");
+		}
+	};
+	module.exports = Result;
+	Result.default = Result;
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/warn-once.js
+var require_warn_once$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let printed = {};
+	module.exports = function warnOnce(message) {
+		if (printed[message]) return;
+		printed[message] = true;
+		if (typeof console !== "undefined" && console.warn) console.warn(message);
+	};
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/lazy-result.js
+var require_lazy_result$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container$1();
+	let Document = require_document$1();
+	let MapGenerator = require_map_generator$1();
+	let parse = require_parse$1();
+	let Result = require_result$1();
+	let Root = require_root$1();
+	let stringify = require_stringify$1();
+	let { isClean, my } = require_symbols$1();
+	let warnOnce = require_warn_once$1();
+	const TYPE_TO_CLASS_NAME = {
+		atrule: "AtRule",
+		comment: "Comment",
+		decl: "Declaration",
+		document: "Document",
+		root: "Root",
+		rule: "Rule"
+	};
+	const PLUGIN_PROPS = {
+		AtRule: true,
+		AtRuleExit: true,
+		Comment: true,
+		CommentExit: true,
+		Declaration: true,
+		DeclarationExit: true,
+		Document: true,
+		DocumentExit: true,
+		Once: true,
+		OnceExit: true,
+		postcssPlugin: true,
+		prepare: true,
+		Root: true,
+		RootExit: true,
+		Rule: true,
+		RuleExit: true
+	};
+	const NOT_VISITORS = {
+		Once: true,
+		postcssPlugin: true,
+		prepare: true
+	};
+	const CHILDREN = 0;
+	function isPromise(obj) {
+		return typeof obj === "object" && typeof obj.then === "function";
+	}
+	function getEvents(node) {
+		let key = false;
+		let type = TYPE_TO_CLASS_NAME[node.type];
+		if (node.type === "decl") key = node.prop.toLowerCase();
+		else if (node.type === "atrule") key = node.name.toLowerCase();
+		if (key && node.append) return [
+			type,
+			type + "-" + key,
+			CHILDREN,
+			type + "Exit",
+			type + "Exit-" + key
+		];
+		else if (key) return [
+			type,
+			type + "-" + key,
+			type + "Exit",
+			type + "Exit-" + key
+		];
+		else if (node.append) return [
+			type,
+			CHILDREN,
+			type + "Exit"
+		];
+		else return [type, type + "Exit"];
+	}
+	function toStack(node) {
+		let events;
+		if (node.type === "document") events = [
+			"Document",
+			CHILDREN,
+			"DocumentExit"
+		];
+		else if (node.type === "root") events = [
+			"Root",
+			CHILDREN,
+			"RootExit"
+		];
+		else events = getEvents(node);
+		return {
+			eventIndex: 0,
+			events,
+			iterator: 0,
+			node,
+			visitorIndex: 0,
+			visitors: []
+		};
+	}
+	function cleanMarks(node) {
+		let stack = [node];
+		while (stack.length > 0) {
+			let next = stack.pop();
+			next[isClean] = false;
+			if (next.nodes) for (let i of next.nodes) stack.push(i);
+		}
+		return node;
+	}
+	let postcss = {};
+	var LazyResult = class LazyResult {
+		get content() {
+			return this.stringify().content;
+		}
+		get css() {
+			return this.stringify().css;
+		}
+		get map() {
+			return this.stringify().map;
+		}
+		get messages() {
+			return this.sync().messages;
+		}
+		get opts() {
+			return this.result.opts;
+		}
+		get processor() {
+			return this.result.processor;
+		}
+		get root() {
+			return this.sync().root;
+		}
+		get [Symbol.toStringTag]() {
+			return "LazyResult";
+		}
+		constructor(processor, css, opts) {
+			this.stringified = false;
+			this.processed = false;
+			let root;
+			if (typeof css === "object" && css !== null && (css.type === "root" || css.type === "document")) root = cleanMarks(css);
+			else if (css instanceof LazyResult || css instanceof Result) {
+				root = cleanMarks(css.root);
+				if (css.map) {
+					if (typeof opts.map === "undefined") opts.map = {};
+					if (!opts.map.inline) opts.map.inline = false;
+					opts.map.prev = css.map;
+				}
+			} else {
+				let parser = parse;
+				if (opts.syntax) parser = opts.syntax.parse;
+				if (opts.parser) parser = opts.parser;
+				if (parser.parse) parser = parser.parse;
+				try {
+					root = parser(css, opts);
+				} catch (error) {
+					this.processed = true;
+					this.error = error;
+				}
+				if (root && !root[my])
+ /* c8 ignore next 2 */
+				Container.rebuild(root);
+			}
+			this.result = new Result(processor, root, opts);
+			this.helpers = {
+				...postcss,
+				postcss,
+				result: this.result
+			};
+			this.plugins = this.processor.plugins.map((plugin) => {
+				if (typeof plugin === "object" && plugin.prepare) return {
+					...plugin,
+					...plugin.prepare(this.result)
+				};
+				else return plugin;
+			});
+		}
+		async() {
+			if (this.error) return Promise.reject(this.error);
+			if (this.processed) return Promise.resolve(this.result);
+			if (!this.processing) this.processing = this.runAsync();
+			return this.processing;
+		}
+		catch(onRejected) {
+			return this.async().catch(onRejected);
+		}
+		finally(onFinally) {
+			return this.async().then(onFinally, onFinally);
+		}
+		getAsyncError() {
+			throw new Error("Use process(css).then(cb) to work with async plugins");
+		}
+		handleError(error, node) {
+			let plugin = this.result.lastPlugin;
+			try {
+				if (node) node.addToError(error);
+				this.error = error;
+				if (error.name === "CssSyntaxError" && !error.plugin) {
+					error.plugin = plugin.postcssPlugin;
+					error.setMessage();
+				} else if (plugin.postcssVersion) {
+					if (process.env.NODE_ENV !== "production") {
+						let pluginName = plugin.postcssPlugin;
+						let pluginVer = plugin.postcssVersion;
+						let runtimeVer = this.result.processor.version;
+						let a = pluginVer.split(".");
+						let b = runtimeVer.split(".");
+						if (a[0] !== b[0] || parseInt(a[1]) > parseInt(b[1])) console.error("Unknown error from PostCSS plugin. Your current PostCSS version is " + runtimeVer + ", but " + pluginName + " uses " + pluginVer + ". Perhaps this is the source of the error below.");
+					}
+				}
+			} catch (err) {
+				/* c8 ignore next 3 */
+				if (console && console.error) console.error(err);
+			}
+			return error;
+		}
+		prepareVisitors() {
+			this.listeners = {};
+			let add = (plugin, type, cb) => {
+				if (!this.listeners[type]) this.listeners[type] = [];
+				this.listeners[type].push([plugin, cb]);
+			};
+			for (let plugin of this.plugins) if (typeof plugin === "object") for (let event in plugin) {
+				if (!PLUGIN_PROPS[event] && /^[A-Z]/.test(event)) throw new Error(`Unknown event ${event} in ${plugin.postcssPlugin}. Try to update PostCSS (${this.processor.version} now).`);
+				if (!NOT_VISITORS[event]) {
+					if (typeof plugin[event] === "object") for (let filter in plugin[event]) if (filter === "*") add(plugin, event, plugin[event][filter]);
+					else add(plugin, event + "-" + filter.toLowerCase(), plugin[event][filter]);
+					else if (typeof plugin[event] === "function") add(plugin, event, plugin[event]);
+				}
+			}
+			this.hasListener = Object.keys(this.listeners).length > 0;
+		}
+		async runAsync() {
+			this.plugin = 0;
+			for (let i = 0; i < this.plugins.length; i++) {
+				let plugin = this.plugins[i];
+				let promise = this.runOnRoot(plugin);
+				if (isPromise(promise)) try {
+					await promise;
+				} catch (error) {
+					throw this.handleError(error);
+				}
+			}
+			this.prepareVisitors();
+			if (this.hasListener) {
+				let root = this.result.root;
+				while (!root[isClean]) {
+					root[isClean] = true;
+					let stack = [toStack(root)];
+					while (stack.length > 0) {
+						let promise = this.visitTick(stack);
+						if (isPromise(promise)) try {
+							await promise;
+						} catch (e) {
+							let node = stack[stack.length - 1].node;
+							throw this.handleError(e, node);
+						}
+					}
+				}
+				if (this.listeners.OnceExit) for (let [plugin, visitor] of this.listeners.OnceExit) {
+					this.result.lastPlugin = plugin;
+					try {
+						if (root.type === "document") {
+							let roots = root.nodes.map((subRoot) => visitor(subRoot, this.helpers));
+							await Promise.all(roots);
+						} else await visitor(root, this.helpers);
+					} catch (e) {
+						throw this.handleError(e);
+					}
+				}
+			}
+			this.processed = true;
+			return this.stringify();
+		}
+		runOnRoot(plugin) {
+			this.result.lastPlugin = plugin;
+			try {
+				if (typeof plugin === "object" && plugin.Once) {
+					if (this.result.root.type === "document") {
+						let roots = this.result.root.nodes.map((root) => plugin.Once(root, this.helpers));
+						if (isPromise(roots[0])) return Promise.all(roots);
+						return roots;
+					}
+					return plugin.Once(this.result.root, this.helpers);
+				} else if (typeof plugin === "function") return plugin(this.result.root, this.result);
+			} catch (error) {
+				throw this.handleError(error);
+			}
+		}
+		stringify() {
+			if (this.error) throw this.error;
+			if (this.stringified) return this.result;
+			this.stringified = true;
+			this.sync();
+			let opts = this.result.opts;
+			let str = stringify;
+			if (opts.syntax) str = opts.syntax.stringify;
+			if (opts.stringifier) str = opts.stringifier;
+			if (str.stringify) str = str.stringify;
+			let rootSource = this.result.root.source;
+			if (opts.map === void 0 && !(rootSource && rootSource.input && rootSource.input.map)) {
+				let result = "";
+				str(this.result.root, (i) => {
+					result += i;
+				});
+				this.result.css = result;
+				return this.result;
+			}
+			let data = new MapGenerator(str, this.result.root, this.result.opts).generate();
+			this.result.css = data[0];
+			this.result.map = data[1];
+			return this.result;
+		}
+		sync() {
+			if (this.error) throw this.error;
+			if (this.processed) return this.result;
+			this.processed = true;
+			if (this.processing) throw this.getAsyncError();
+			for (let plugin of this.plugins) if (isPromise(this.runOnRoot(plugin))) throw this.getAsyncError();
+			this.prepareVisitors();
+			if (this.hasListener) {
+				let root = this.result.root;
+				while (!root[isClean]) {
+					root[isClean] = true;
+					this.walkSync(root);
+				}
+				if (this.listeners.OnceExit) {
+					if (root.type === "document") for (let subRoot of root.nodes) this.visitSync(this.listeners.OnceExit, subRoot);
+					else this.visitSync(this.listeners.OnceExit, root);
+				}
+			}
+			return this.result;
+		}
+		then(onFulfilled, onRejected) {
+			if (process.env.NODE_ENV !== "production") {
+				if (!("from" in this.opts)) warnOnce("Without `from` option PostCSS could generate wrong source map and will not find Browserslist config. Set it to CSS file path or to `undefined` to prevent this warning.");
+			}
+			return this.async().then(onFulfilled, onRejected);
+		}
+		toString() {
+			return this.css;
+		}
+		visitSync(visitors, node) {
+			for (let [plugin, visitor] of visitors) {
+				this.result.lastPlugin = plugin;
+				let promise;
+				try {
+					promise = visitor(node, this.helpers);
+				} catch (e) {
+					throw this.handleError(e, node.proxyOf);
+				}
+				if (node.type !== "root" && node.type !== "document" && !node.parent) return true;
+				if (isPromise(promise)) throw this.getAsyncError();
+			}
+		}
+		visitTick(stack) {
+			let visit = stack[stack.length - 1];
+			let { node, visitors } = visit;
+			if (node.type !== "root" && node.type !== "document" && !node.parent) {
+				stack.pop();
+				return;
+			}
+			if (visitors.length > 0 && visit.visitorIndex < visitors.length) {
+				let [plugin, visitor] = visitors[visit.visitorIndex];
+				visit.visitorIndex += 1;
+				if (visit.visitorIndex === visitors.length) {
+					visit.visitors = [];
+					visit.visitorIndex = 0;
+				}
+				this.result.lastPlugin = plugin;
+				try {
+					return visitor(node.toProxy(), this.helpers);
+				} catch (e) {
+					throw this.handleError(e, node);
+				}
+			}
+			if (visit.iterator !== 0) {
+				let iterator = visit.iterator;
+				if (visit.descending) {
+					visit.descending = false;
+					node.indexes[iterator] += 1;
+				}
+				let child;
+				while (child = node.nodes[node.indexes[iterator]]) {
+					if (!child[isClean]) {
+						child[isClean] = true;
+						visit.descending = true;
+						stack.push(toStack(child));
+						return;
+					}
+					node.indexes[iterator] += 1;
+				}
+				visit.iterator = 0;
+				delete node.indexes[iterator];
+			}
+			let events = visit.events;
+			while (visit.eventIndex < events.length) {
+				let event = events[visit.eventIndex];
+				visit.eventIndex += 1;
+				if (event === CHILDREN) {
+					if (node.nodes && node.nodes.length) {
+						node[isClean] = true;
+						visit.iterator = node.getIterator();
+					}
+					return;
+				} else if (this.listeners[event]) {
+					visit.visitors = this.listeners[event];
+					return;
+				}
+			}
+			stack.pop();
+		}
+		walkSync(node) {
+			node[isClean] = true;
+			let stack = [{
+				eventIndex: 0,
+				events: getEvents(node),
+				iterator: 0,
+				node
+			}];
+			while (stack.length > 0) {
+				let visit = stack[stack.length - 1];
+				let visitNode = visit.node;
+				if (visit.iterator !== 0) {
+					let iterator = visit.iterator;
+					if (visit.descending) {
+						visit.descending = false;
+						visitNode.indexes[iterator] += 1;
+					}
+					let child;
+					let descended = false;
+					while (child = visitNode.nodes[visitNode.indexes[iterator]]) {
+						if (!child[isClean]) {
+							child[isClean] = true;
+							visit.descending = true;
+							stack.push({
+								eventIndex: 0,
+								events: getEvents(child),
+								iterator: 0,
+								node: child
+							});
+							descended = true;
+							break;
+						}
+						visitNode.indexes[iterator] += 1;
+					}
+					if (descended) continue;
+					visit.iterator = 0;
+					delete visitNode.indexes[iterator];
+				}
+				if (visit.eventIndex < visit.events.length) {
+					let event = visit.events[visit.eventIndex];
+					visit.eventIndex += 1;
+					if (event === CHILDREN) {
+						if (visitNode.nodes && visitNode.nodes.length) visit.iterator = visitNode.getIterator();
+					} else {
+						let visitors = this.listeners[event];
+						if (visitors) {
+							if (this.visitSync(visitors, visitNode.toProxy())) stack.pop();
+						}
+					}
+					continue;
+				}
+				stack.pop();
+			}
+		}
+		warnings() {
+			return this.sync().warnings();
+		}
+	};
+	LazyResult.registerPostcss = (dependant) => {
+		postcss = dependant;
+	};
+	module.exports = LazyResult;
+	LazyResult.default = LazyResult;
+	Root.registerLazyResult(LazyResult);
+	Document.registerLazyResult(LazyResult);
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/no-work-result.js
+var require_no_work_result$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let MapGenerator = require_map_generator$1();
+	let parse = require_parse$1();
+	let Result = require_result$1();
+	let stringify = require_stringify$1();
+	let warnOnce = require_warn_once$1();
+	var NoWorkResult = class {
+		get content() {
+			return this.result.css;
+		}
+		get css() {
+			return this.result.css;
+		}
+		get map() {
+			return this.result.map;
+		}
+		get messages() {
+			return [];
+		}
+		get opts() {
+			return this.result.opts;
+		}
+		get processor() {
+			return this.result.processor;
+		}
+		get root() {
+			if (this._root) return this._root;
+			let root;
+			let parser = parse;
+			try {
+				root = parser(this._css, this._opts);
+			} catch (error) {
+				this.error = error;
+			}
+			if (this.error) throw this.error;
+			else {
+				this._root = root;
+				return root;
+			}
+		}
+		get [Symbol.toStringTag]() {
+			return "NoWorkResult";
+		}
+		constructor(processor, css, opts) {
+			css = css.toString();
+			this.stringified = false;
+			this._processor = processor;
+			this._css = css;
+			this._opts = opts;
+			this._map = void 0;
+			let str = stringify;
+			this.result = new Result(this._processor, void 0, this._opts);
+			this.result.css = css;
+			let self = this;
+			Object.defineProperty(this.result, "root", { get() {
+				return self.root;
+			} });
+			let map = new MapGenerator(str, void 0, this._opts, css);
+			if (map.isMap()) {
+				let [generatedCSS, generatedMap] = map.generate();
+				if (generatedCSS) this.result.css = generatedCSS;
+				if (generatedMap) this.result.map = generatedMap;
+			} else {
+				map.clearAnnotation();
+				this.result.css = map.css;
+			}
+		}
+		async() {
+			if (this.error) return Promise.reject(this.error);
+			return Promise.resolve(this.result);
+		}
+		catch(onRejected) {
+			return this.async().catch(onRejected);
+		}
+		finally(onFinally) {
+			return this.async().then(onFinally, onFinally);
+		}
+		sync() {
+			if (this.error) throw this.error;
+			return this.result;
+		}
+		then(onFulfilled, onRejected) {
+			if (process.env.NODE_ENV !== "production") {
+				if (!("from" in this._opts)) warnOnce("Without `from` option PostCSS could generate wrong source map and will not find Browserslist config. Set it to CSS file path or to `undefined` to prevent this warning.");
+			}
+			return this.async().then(onFulfilled, onRejected);
+		}
+		toString() {
+			return this._css;
+		}
+		warnings() {
+			return [];
+		}
+	};
+	module.exports = NoWorkResult;
+	NoWorkResult.default = NoWorkResult;
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/processor.js
+var require_processor$1 = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Document = require_document$1();
+	let LazyResult = require_lazy_result$1();
+	let NoWorkResult = require_no_work_result$1();
+	let Root = require_root$1();
+	var Processor = class {
+		constructor(plugins = []) {
+			this.version = "8.5.28";
+			this.plugins = this.normalize(plugins);
+		}
+		normalize(plugins) {
+			let normalized = [];
+			for (let i of plugins) {
+				if (i.postcss === true) i = i();
+				else if (i.postcss) i = i.postcss;
+				if (typeof i === "object" && Array.isArray(i.plugins)) normalized = normalized.concat(i.plugins);
+				else if (typeof i === "object" && i.postcssPlugin) normalized.push(i);
+				else if (typeof i === "function") normalized.push(i);
+				else if (typeof i === "object" && (i.parse || i.stringify)) {
+					if (process.env.NODE_ENV !== "production") throw new Error("PostCSS syntaxes cannot be used as plugins. Instead, please use one of the syntax/parser/stringifier options as outlined in your PostCSS runner documentation.");
+				} else throw new Error(i + " is not a PostCSS plugin");
+			}
+			return normalized;
+		}
+		process(css, opts = {}) {
+			if (!this.plugins.length && !opts.parser && !opts.stringifier && !opts.syntax) return new NoWorkResult(this, css, opts);
+			else return new LazyResult(this, css, opts);
+		}
+		use(plugin) {
+			this.plugins = this.plugins.concat(this.normalize([plugin]));
+			return this;
+		}
+	};
+	module.exports = Processor;
+	Processor.default = Processor;
+	Root.registerProcessor(Processor);
+	Document.registerProcessor(Processor);
+}));
+//#endregion
+//#region ../dsgraph-adapters/node_modules/postcss/lib/postcss.mjs
+var import_postcss = /* @__PURE__ */ __toESM((/* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let AtRule = require_at_rule$1();
+	let Comment = require_comment$1();
+	let Container = require_container$1();
+	let CssSyntaxError = require_css_syntax_error$1();
+	let Declaration = require_declaration$1();
+	let Document = require_document$1();
+	let fromJSON = require_fromJSON$1();
+	let Input = require_input$1();
+	let LazyResult = require_lazy_result$1();
+	let list = require_list$1();
+	let Node = require_node$1();
+	let parse = require_parse$1();
+	let Processor = require_processor$1();
+	let Result = require_result$1();
+	let Root = require_root$1();
+	let Rule = require_rule$1();
+	let stringify = require_stringify$1();
+	let Warning = require_warning$1();
+	function postcss(...plugins) {
+		if (plugins.length === 1 && Array.isArray(plugins[0])) plugins = plugins[0];
+		return new Processor(plugins);
+	}
+	postcss.plugin = function plugin(name, initializer) {
+		let warningPrinted = false;
+		function creator(...args) {
+			if (console && console.warn && !warningPrinted) {
+				warningPrinted = true;
+				console.warn(name + ": postcss.plugin was deprecated. Migration guide:\nhttps://evilmartians.com/chronicles/postcss-8-plugin-migration");
+				if (process.env.LANG && process.env.LANG.startsWith("zh"))
+ /* c8 ignore next 7 */
+				console.warn(name + ": 里面 postcss.plugin 被弃用. 迁移指南:\nhttps://www.w3ctech.com/topic/2226");
+			}
+			let transformer = initializer(...args);
+			transformer.postcssPlugin = name;
+			transformer.postcssVersion = new Processor().version;
+			return transformer;
+		}
+		let cache;
+		Object.defineProperty(creator, "postcss", { get() {
+			if (!cache) cache = creator();
+			return cache;
+		} });
+		creator.process = function(css, processOpts, pluginOpts) {
+			return postcss([creator(pluginOpts)]).process(css, processOpts);
+		};
+		return creator;
+	};
+	postcss.stringify = stringify;
+	postcss.parse = parse;
+	postcss.fromJSON = fromJSON;
+	postcss.list = list;
+	postcss.comment = (defaults) => new Comment(defaults);
+	postcss.atRule = (defaults) => new AtRule(defaults);
+	postcss.decl = (defaults) => new Declaration(defaults);
+	postcss.rule = (defaults) => new Rule(defaults);
+	postcss.root = (defaults) => new Root(defaults);
+	postcss.document = (defaults) => new Document(defaults);
+	postcss.CssSyntaxError = CssSyntaxError;
+	postcss.Declaration = Declaration;
+	postcss.Container = Container;
+	postcss.Processor = Processor;
+	postcss.Document = Document;
+	postcss.Comment = Comment;
+	postcss.Warning = Warning;
+	postcss.AtRule = AtRule;
+	postcss.Result = Result;
+	postcss.Input = Input;
+	postcss.Rule = Rule;
+	postcss.Root = Root;
+	postcss.Node = Node;
+	LazyResult.registerPostcss(postcss);
+	module.exports = postcss;
+	postcss.default = postcss;
+})))(), 1);
+var postcss_default = import_postcss.default;
+import_postcss.default.stringify;
+import_postcss.default.fromJSON;
+import_postcss.default.plugin;
+import_postcss.default.parse;
+import_postcss.default.list;
+import_postcss.default.document;
+import_postcss.default.comment;
+import_postcss.default.atRule;
+import_postcss.default.rule;
+import_postcss.default.decl;
+import_postcss.default.root;
+import_postcss.default.CssSyntaxError;
+import_postcss.default.Declaration;
+import_postcss.default.Container;
+import_postcss.default.Processor;
+import_postcss.default.Document;
+import_postcss.default.Comment;
+import_postcss.default.Warning;
+import_postcss.default.AtRule;
+import_postcss.default.Result;
+import_postcss.default.Input;
+import_postcss.default.Rule;
+import_postcss.default.Root;
+import_postcss.default.Node;
+//#endregion
+//#region ../dsgraph-adapters/dist/css-values.js
+/** Splits at top-level separators, ignoring those inside parentheses and quotes. */
+function splitTopLevel(input, sep) {
+	const out = [];
+	let depth = 0;
+	let quote = "";
+	let cur = "";
+	for (const ch of input) {
+		if (quote) {
+			cur += ch;
+			if (ch === quote) quote = "";
+			continue;
+		}
+		if (ch === "\"" || ch === "'") quote = ch;
+		else if (ch === "(") depth++;
+		else if (ch === ")") depth--;
+		if ((sep === " " ? /\s/.test(ch) : ch === sep) && depth === 0) {
+			if (cur.trim() !== "") out.push(cur.trim());
+			cur = "";
+		} else cur += ch;
+	}
+	if (cur.trim() !== "") out.push(cur.trim());
+	return out;
+}
+/** `var(--name)` or `var(--name, fallback)` spanning the whole value. */
+function parseVar(value) {
+	const v = value.trim();
+	if (!v.startsWith("var(") || !v.endsWith(")")) return void 0;
+	let depth = 0;
+	for (let i = 3; i < v.length; i++) if (v[i] === "(") depth++;
+	else if (v[i] === ")") {
+		depth--;
+		if (depth === 0 && i !== v.length - 1) return void 0;
+	}
+	const [name, ...rest] = splitTopLevel(v.slice(4, -1), ",");
+	if (!name || !/^--[\w\\.-]+$/.test(name.trim())) return void 0;
+	const result = { name: name.trim() };
+	if (rest.length > 0) result.fallback = rest.join(", ");
+	return result;
+}
+/** Token id for a custom property name: drops the leading `--`; dots (only possible escaped) become `_`. */
+const idFromCustomProperty = (prop) => prop.replace(/^--/, "").replace(/\\?\./g, "_");
+const LENGTH$1 = /^(-?(?:\d+\.?\d*|\.\d+))(px|rem|em|%|vw|vh|vmin|vmax|ch|ex|pt|cqw|cqh|cqi|dvh|svh|lvh|lh|rlh)$/i;
+const NUMBER = /^-?(?:\d+\.?\d*|\.\d+)$/;
+const DURATION = /^(-?(?:\d+\.?\d*|\.\d+))(ms|s)$/;
+const EASINGS = {
+	ease: [
+		.25,
+		.1,
+		.25,
+		1
+	],
+	"ease-in": [
+		.42,
+		0,
+		1,
+		1
+	],
+	"ease-out": [
+		0,
+		0,
+		.58,
+		1
+	],
+	"ease-in-out": [
+		.42,
+		0,
+		.58,
+		1
+	],
+	linear: [
+		0,
+		0,
+		1,
+		1
+	]
+};
+const FONT_WEIGHT_WORDS = /* @__PURE__ */ new Set([
+	"normal",
+	"bold",
+	"light",
+	"medium",
+	"thin",
+	"black",
+	"regular",
+	"semi-bold",
+	"extra-bold"
+]);
+const GENERIC_FAMILIES = /* @__PURE__ */ new Set([
+	"serif",
+	"sans-serif",
+	"monospace",
+	"cursive",
+	"fantasy",
+	"system-ui",
+	"ui-sans-serif",
+	"ui-serif",
+	"ui-monospace",
+	"ui-rounded",
+	"emoji",
+	"math"
+]);
+const NON_COLORS = /* @__PURE__ */ new Set([
+	"inherit",
+	"initial",
+	"unset",
+	"revert",
+	"currentcolor",
+	"none"
+]);
+const hint = (name, words) => words.test(name.toLowerCase());
+const isDimensionName = (n) => hint(n, /(space|spacing|size|radius|width|height|gap|inset|offset|gutter|padding|margin|indent|blur|spread|border-w)/);
+/** A sub-value inside a composite: a reference, a color or a length. */
+function subValue(part, expect) {
+	const v = parseVar(part);
+	if (v) return `{${idFromCustomProperty(v.name)}}`;
+	if (expect === "color") return cssColorToDtcg(part);
+	const m = LENGTH$1.exec(part);
+	if (m) return {
+		value: Number(m[1]),
+		unit: m[2].toLowerCase()
+	};
+	if (part === "0") return {
+		value: 0,
+		unit: "px"
+	};
+}
+function parseShadow(value) {
+	const layers = [];
+	for (const layer of splitTopLevel(value, ",")) {
+		const parts = splitTopLevel(layer, " ");
+		let inset = false;
+		let color;
+		const lengths = [];
+		for (const p of parts) if (p.toLowerCase() === "inset") inset = true;
+		else {
+			const len = subValue(p, "dimension");
+			if (len !== void 0 && (typeof len !== "string" || lengths.length < 2)) lengths.push(len);
+			else {
+				const c = subValue(p, "color");
+				if (c === void 0 || color !== void 0) return void 0;
+				color = c;
+			}
+		}
+		if (lengths.length < 2 || lengths.length > 4 || color === void 0) return void 0;
+		const zero = {
+			value: 0,
+			unit: "px"
+		};
+		layers.push({
+			color,
+			offsetX: lengths[0],
+			offsetY: lengths[1],
+			blur: lengths[2] ?? zero,
+			spread: lengths[3] ?? zero,
+			inset
+		});
+	}
+	return layers.length > 0 ? layers : void 0;
+}
+/**
+* Infers a DTCG type for a custom property value. Whole `var()` becomes an alias (type comes from
+* the target); anything that cannot be represented becomes a `css-expression` that keeps its text.
+*/
+function cssValueToToken(prop, raw) {
+	const value = raw.trim();
+	const name = prop.replace(/^--/, "");
+	const ref = parseVar(value);
+	if (ref) return { $value: `{${idFromCustomProperty(ref.name)}}` };
+	const lower = value.toLowerCase();
+	if (!NON_COLORS.has(lower)) {
+		const color = cssColorToDtcg(value);
+		if (color && !NUMBER.test(value)) return {
+			$type: "color",
+			$value: color
+		};
+	}
+	let m = LENGTH$1.exec(value);
+	if (m) return {
+		$type: "dimension",
+		$value: {
+			value: Number(m[1]),
+			unit: m[2].toLowerCase()
+		}
+	};
+	m = DURATION.exec(value);
+	if (m) return {
+		$type: "duration",
+		$value: {
+			value: Number(m[1]),
+			unit: m[2]
+		}
+	};
+	if (NUMBER.test(value)) {
+		const n = Number(value);
+		if (hint(name, /weight/) && n >= 1 && n <= 1e3) return {
+			$type: "fontWeight",
+			$value: n
+		};
+		if (n === 0 && isDimensionName(name)) return {
+			$type: "dimension",
+			$value: {
+				value: 0,
+				unit: "px"
+			}
+		};
+		return {
+			$type: "number",
+			$value: n
+		};
+	}
+	if (hint(name, /weight/) && FONT_WEIGHT_WORDS.has(lower)) return {
+		$type: "fontWeight",
+		$value: lower
+	};
+	const bezier = /^cubic-bezier\(([^)]*)\)$/i.exec(value);
+	if (bezier) {
+		const nums = bezier[1].split(",").map((s) => Number(s.trim()));
+		if (nums.length === 4 && nums.every(Number.isFinite)) return {
+			$type: "cubicBezier",
+			$value: nums
+		};
+	}
+	if (EASINGS[lower] && hint(name, /(ease|easing|timing|curve|motion)/)) return {
+		$type: "cubicBezier",
+		$value: EASINGS[lower]
+	};
+	const families = splitTopLevel(value, ",");
+	if (families.length > 1 && families.every((f) => /^(["'][^"']+["']|[\w -]+)$/.test(f)) && families.some((f) => GENERIC_FAMILIES.has(f.toLowerCase()) || /^["']/.test(f)) || hint(name, /(font-family|family|typeface|font-sans|font-serif|font-mono)/) && families.length >= 1 && !value.includes("(")) return {
+		$type: "fontFamily",
+		$value: families.map((f) => f.replace(/^["']|["']$/g, ""))
+	};
+	if (hint(name, /shadow|elevation/) || /\d(px|rem)?\s+-?\d/.test(value)) {
+		const shadow = parseShadow(value);
+		if (shadow) return {
+			$type: "shadow",
+			$value: shadow
+		};
+	}
+	return {
+		$type: "css-expression",
+		$value: value
+	};
+}
+//#endregion
+//#region ../dsgraph-adapters/dist/css-tokens.js
+const ROOT_LIKE = /^(:root|html|:host|body|\*)(:not\([^)]*\))*$/;
+const ATTR_THEME = /^(?::root|html|body|:host)?\[(data-[\w-]+)(?:=["']?([\w-]+)["']?)?\](:not\([^)]*\))*$/;
+const CLASS_THEME = /^(?::root|html|body|:host)?\.(dark|light|theme-([\w-]+)|([\w-]+)-theme)(:not\([^)]*\))*$/;
+const COLOR_SCHEME = /prefers-color-scheme\s*:\s*(dark|light)/i;
+/** Several attributes at once: `[data-color-mode="dark"][data-dark-theme="dark_dimmed"]`. */
+const COMPOUND_ATTR = /^(?::root|html|body|:host)?((?:\[data-[\w-]+(?:=["']?[\w-]+["']?)?\]){2,})(:not\([^)]*\))*$/;
+const norm = (s) => s.replace(/\s+/g, " ").replace(/["']/g, "").trim().toLowerCase();
+/** Conditional at-rules around a declaration, outermost first (`@layer` is ignored). */
+function atRulesOf(decl) {
+	const out = [];
+	let node = decl.parent?.parent;
+	while (node && node.type !== "root") {
+		if (node.type === "atrule") {
+			const at = node;
+			if (at.name !== "layer") out.unshift(`@${at.name} ${norm(at.params)}`);
+		}
+		node = node.parent;
+	}
+	return out;
+}
+/** Well-known conditions under the names people use for them. */
+const KNOWN_CONDITIONS = [
+	[/display-p3|color-gamut\s*:\s*p3/, "display-p3"],
+	[/color-gamut\s*:\s*rec2020/, "rec2020"],
+	[/prefers-reduced-motion\s*:\s*reduce/, "reduced-motion"],
+	[/prefers-contrast\s*:\s*more/, "high-contrast"],
+	[/prefers-contrast\s*:\s*less/, "low-contrast"],
+	[/forced-colors\s*:\s*active/, "forced-colors"]
+];
+/**
+* A short modifier name for an at-rule: `@media (min-width: 768px)` → `min-width: 768px`,
+* `@supports (color: color(display-p3 1 1 1))` → `display-p3`.
+*/
+function conditionName(atRule) {
+	for (const [re, name] of KNOWN_CONDITIONS) if (re.test(atRule)) return name;
+	const m = /^@(\w+)\s*(.*)$/.exec(atRule.trim());
+	if (!m) return atRule;
+	const params = m[2].replace(/^\((.*)\)$/, "$1").replace(/\(([^()]*)\)/g, "").replace(/\s+/g, " ").trim();
+	return m[1] === "media" ? params : `${m[1]} ${params}`;
+}
+function autoPlacement(selectors, atRules) {
+	const media = atRules.find((a) => !COLOR_SCHEME.test(a));
+	const scheme = atRules.map((a) => COLOR_SCHEME.exec(a)?.[1]?.toLowerCase()).find(Boolean);
+	for (const raw of selectors) {
+		const sel = raw.replace(/\s+/g, "");
+		if (ROOT_LIKE.test(sel)) {
+			if (media) return {
+				kind: "context",
+				modifier: conditionName(media),
+				context: "on",
+				boolean: true
+			};
+			if (scheme) return {
+				kind: "context",
+				modifier: "theme",
+				context: scheme
+			};
+			return { kind: "base" };
+		}
+		const attr = ATTR_THEME.exec(sel);
+		if (attr && !media) return {
+			kind: "context",
+			modifier: attr[1].replace(/^data-/, ""),
+			context: attr[2] ?? "on"
+		};
+		const cls = CLASS_THEME.exec(sel);
+		if (cls && !media) return {
+			kind: "context",
+			modifier: "theme",
+			context: cls[2] ?? cls[3] ?? cls[1]
+		};
+		const compound = COMPOUND_ATTR.exec(sel);
+		if (compound && !media) {
+			const values = [...compound[1].matchAll(/=["']?([\w-]+)["']?\]/g)].map((m) => m[1]);
+			if (values.length) return {
+				kind: "context",
+				modifier: "theme",
+				context: values[values.length - 1]
+			};
+		}
+	}
+	return { kind: "skip" };
+}
+/** Configured placement: `css.contexts` patterns such as `[data-theme=dark]` or `@media (prefers-color-scheme: dark) :root`. */
+function configuredPlacement(selectors, atRules, contexts) {
+	const sels = selectors.map(norm);
+	for (const [modifier, ctxs] of Object.entries(contexts)) for (const [context, patterns] of Object.entries(ctxs)) for (const pattern of patterns) {
+		const m = /^(@\w+\s*\([^)]*\))?\s*(.*)$/.exec(pattern.trim());
+		const atPart = m[1] ? norm(m[1].replace(/^@(\w+)\s*/, "@$1 ")) : void 0;
+		const selPart = m[2] ? norm(m[2]) : void 0;
+		const atOk = atPart ? atRules.includes(atPart) : atRules.length === 0;
+		const selOk = selPart ? sels.includes(selPart) : sels.some((s) => ROOT_LIKE.test(s.replace(/\s+/g, "")));
+		if (atOk && selOk) return {
+			kind: "context",
+			modifier,
+			context
+		};
+	}
+}
+/**
+* CSS custom properties → token system (spec section 4.3). Root-like rules form the base set;
+* theme selectors and `prefers-color-scheme` become a `theme`-style modifier; other media queries
+* become independent on/off modifiers. Scoped variables (e.g. `.button { --x }`) are not tokens.
+*/
+const cssTokens = {
+	name: "tokens-css",
+	async detect(source, config) {
+		const exclude = excludeFor(config, "css");
+		const files = (await source.list(config.css?.include ?? ["**/*.css"])).filter((p) => !matchGlob(p, exclude));
+		if (config.css?.include) return files;
+		await prefetch(source, files);
+		const out = [];
+		for (const f of files) {
+			const text = await source.readText(f);
+			if (/--[\w-]+\s*:/.test(text) && /(:root|html|:host|\[data-|prefers-color-scheme|\.(dark|light)\b|\.theme-|-theme\b)/.test(text)) out.push(f);
+		}
+		return out;
+	},
+	async load(source, files, config, diag) {
+		const configured = config.css?.contexts;
+		const base = [];
+		const modifiers = /* @__PURE__ */ new Map();
+		const orderOfModifiers = [];
+		await prefetch(source, files);
+		for (const file of [...files].sort()) {
+			let root;
+			try {
+				root = postcss_default.parse(await source.readText(file), { from: file });
+			} catch (e) {
+				diag.error("css/parse-error", e.message, { file });
+				continue;
+			}
+			const baseTree = {};
+			const contextTrees = /* @__PURE__ */ new Map();
+			let skipped = 0;
+			root.walkDecls((decl) => {
+				if (!decl.prop.startsWith("--")) return;
+				const rule = decl.parent;
+				if (rule?.type !== "rule") {
+					skipped++;
+					return;
+				}
+				const selectors = rule.selectors;
+				const atRules = atRulesOf(decl);
+				const placement = (configured && configuredPlacement(selectors, atRules, configured)) ?? (configured ? selectors.some((s) => ROOT_LIKE.test(s.replace(/\s+/g, ""))) && atRules.length === 0 ? { kind: "base" } : { kind: "skip" } : autoPlacement(selectors, atRules));
+				if (placement.kind === "skip") {
+					skipped++;
+					return;
+				}
+				const id = idFromCustomProperty(decl.prop);
+				const entry = cssValueToToken(decl.prop, decl.value);
+				const token = {
+					$value: entry.$value,
+					$extensions: { "dev.dsgraph": { css: decl.prop } }
+				};
+				if (entry.$type) {
+					token.$type = entry.$type;
+					token.$extensions["dev.dsgraph"].typeInferred = true;
+				}
+				if (placement.kind === "base") baseTree[id] = token;
+				else {
+					if (!modifiers.has(placement.modifier)) {
+						modifiers.set(placement.modifier, {
+							contexts: /* @__PURE__ */ new Map(),
+							boolean: placement.boolean ?? false
+						});
+						orderOfModifiers.push(placement.modifier);
+					}
+					const key = `${placement.modifier}\u0000${placement.context}`;
+					const tree = contextTrees.get(key) ?? {};
+					tree[id] = token;
+					contextTrees.set(key, tree);
+				}
+			});
+			if (skipped > 0) diag.info("css/scoped-variable", `${skipped} custom properties outside root or theme selectors are not tokens`, { file });
+			if (Object.keys(baseTree).length > 0) base.push({
+				file,
+				tree: baseTree
+			});
+			for (const [key, tree] of contextTrees) {
+				const [modifier, context] = key.split("\0");
+				const m = modifiers.get(modifier);
+				m.contexts.set(context, [...m.contexts.get(context) ?? [], {
+					file,
+					tree
+				}]);
+			}
+		}
+		const system = {
+			sets: /* @__PURE__ */ new Map([["base", base]]),
+			modifiers: /* @__PURE__ */ new Map(),
+			order: [{
+				kind: "set",
+				name: "base"
+			}],
+			synthetic: true,
+			kind: "css"
+		};
+		for (const name of orderOfModifiers) {
+			const m = modifiers.get(name);
+			const contexts = /* @__PURE__ */ new Map();
+			let defaultContext;
+			if (m.boolean) {
+				contexts.set("off", []);
+				contexts.set("on", m.contexts.get("on") ?? []);
+				defaultContext = "off";
+			} else if (configured?.[name]) {
+				for (const ctx of Object.keys(configured[name])) contexts.set(ctx, m.contexts.get(ctx) ?? []);
+				defaultContext = Object.keys(configured[name])[0];
+			} else {
+				defaultContext = m.contexts.has("light") ? "light" : "default";
+				if (!m.contexts.has(defaultContext)) contexts.set(defaultContext, []);
+				for (const [ctx, docs] of m.contexts) contexts.set(ctx, docs);
+			}
+			system.modifiers.set(name, {
+				contexts,
+				default: defaultContext
+			});
+			system.order.push({
+				kind: "modifier",
+				name
+			});
+		}
+		if (base.length === 0 && modifiers.size === 0) diag.warn("tokens/no-files", "No CSS custom properties found in root or theme selectors");
+		return system;
+	}
+};
+//#endregion
+//#region ../dsgraph-adapters/dist/json-values.js
+/** Types of token-set and value/type JSON → DTCG types. Others keep their own name. */
+const TYPES = {
+	color: "color",
+	dimension: "dimension",
+	sizing: "dimension",
+	spacing: "dimension",
+	size: "dimension",
+	borderRadius: "dimension",
+	borderWidth: "dimension",
+	fontSizes: "dimension",
+	fontSize: "dimension",
+	letterSpacing: "dimension",
+	paragraphSpacing: "dimension",
+	paragraphIndent: "dimension",
+	opacity: "number",
+	number: "number",
+	fontFamilies: "fontFamily",
+	fontFamily: "fontFamily",
+	fontWeights: "fontWeight",
+	fontWeight: "fontWeight",
+	lineHeights: "lineHeight",
+	lineHeight: "lineHeight",
+	typography: "typography",
+	boxShadow: "shadow",
+	shadow: "shadow",
+	border: "border",
+	duration: "duration",
+	time: "duration",
+	easing: "cubicBezier",
+	cubicBezier: "cubicBezier",
+	strokeStyle: "strokeStyle",
+	transition: "transition",
+	gradient: "gradient"
+};
+/** `border-radius` (kebab-case types) → `borderRadius`. */
+const mapKey = (t) => t.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+const mapType = (t) => TYPES[t] ?? TYPES[mapKey(t)] ?? t;
+/** Types only the token-set format uses; their presence tells it from plain value/type JSON. */
+const SET_FORMAT_TYPES = /* @__PURE__ */ new Set([
+	"sizing",
+	"spacing",
+	"borderRadius",
+	"borderWidth",
+	"fontSizes",
+	"fontFamilies",
+	"fontWeights",
+	"lineHeights",
+	"letterSpacing",
+	"paragraphSpacing",
+	"paragraphIndent",
+	"boxShadow",
+	"composition",
+	"textCase",
+	"textDecoration",
+	"opacity"
+]);
+const FONT_WEIGHTS = {
+	thin: 100,
+	hairline: 100,
+	extralight: 200,
+	ultralight: 200,
+	light: 300,
+	normal: 400,
+	regular: 400,
+	book: 400,
+	medium: 500,
+	semibold: 600,
+	demibold: 600,
+	bold: 700,
+	extrabold: 800,
+	ultrabold: 800,
+	black: 900,
+	heavy: 900,
+	extrablack: 950,
+	ultrablack: 950
+};
+const WHOLE_REF = /^\{[^{}]+\}$/;
+const NUM = /^\s*(-?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)\s*$/i;
+const isObj$2 = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+/**
+* References as these tools write them, in DTCG syntax: `{a.b.value}` and `{a.b.$value}` drop the
+* suffix, a whole-value `$a.b` (an early notation) becomes `{a.b}`.
+*/
+function normalizeRefs(v) {
+	if (typeof v === "string") {
+		const s = v.replace(/\{([^{}]+?)\.\$?value\}/g, "{$1}");
+		return /^\$[\w-]+(\.[\w-]+)+$/.test(s) ? `{${s.slice(1)}}` : s;
+	}
+	if (Array.isArray(v)) return v.map(normalizeRefs);
+	if (isObj$2(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, normalizeRefs(x)]));
+	return v;
+}
+const hasRefInside = (s) => s.includes("{") && !WHOLE_REF.test(s.trim());
+const isArithmetic = (s) => /^[\d\s.+\-*/()a-z%]+$/i.test(s) && /\d\s*[-+*/]\s*[\d(.]/.test(s);
+/** A string that stays as text for the core: a reference or an expression with references. */
+function deferred(s, c) {
+	if (WHOLE_REF.test(s.trim())) return s.trim();
+	if (hasRefInside(s)) {
+		c.expression = true;
+		return s;
+	}
+}
+function dimension(v, c, percentAs) {
+	if (typeof v === "number") return {
+		value: v,
+		unit: v === 0 ? "px" : c.unit
+	};
+	if (typeof v !== "string") return v;
+	const d = deferred(v, c);
+	if (d !== void 0) return d;
+	const m = NUM.exec(v);
+	if (m) {
+		const n = Number(m[1]);
+		const unit = m[2].toLowerCase();
+		if (unit === "%" && percentAs === "em") return {
+			value: n / 100,
+			unit: "em"
+		};
+		return {
+			value: n,
+			unit: unit || c.unit
+		};
+	}
+	if (isArithmetic(v) || /^calc\(/i.test(v)) return evaluateExpression(v, "dimension", c.unit) ?? v;
+	return v;
+}
+function numberValue(v, c) {
+	if (typeof v !== "string") return v;
+	const d = deferred(v, c);
+	if (d !== void 0) return d;
+	const m = NUM.exec(v);
+	if (m && (m[2] === "" || m[2] === "%")) return m[2] === "%" ? Number(m[1]) / 100 : Number(m[1]);
+	return evaluateExpression(v, "number") ?? v;
+}
+function color(v, c) {
+	if (typeof v !== "string") return v;
+	const d = deferred(v, c);
+	if (d !== void 0) return d;
+	return cssColorToDtcg(v) ?? evaluateExpression(v, "color") ?? v;
+}
+function fontFamily(v) {
+	if (typeof v !== "string" || WHOLE_REF.test(v.trim())) return v;
+	const list = splitTopLevel(v, ",").map((f) => f.replace(/^["']|["']$/g, ""));
+	return list.length === 1 ? list[0] : list;
+}
+/** `Bold`, `Semi Bold Italic`, `700` → a number; unknown names stay as written. */
+function fontWeight(v) {
+	if (typeof v === "number" || typeof v !== "string" || WHOLE_REF.test(v.trim())) return v;
+	if (/^\d+$/.test(v.trim())) return Number(v);
+	const key = v.toLowerCase().replace(/\b(italic|oblique|(semi|extra|ultra)?\s*(condensed|compressed|expanded|extended)|narrow|wide)\b/g, "").replace(/[\s_-]/g, "");
+	return FONT_WEIGHTS[key === "" ? "regular" : key] ?? v;
+}
+/** Line height: a percentage or a small unitless number is a multiplier; a larger one is px. */
+function lineHeight(v, c) {
+	if (typeof v === "number") return v <= 4 ? {
+		type: "number",
+		value: v
+	} : {
+		type: "dimension",
+		value: {
+			value: v,
+			unit: c.unit
+		}
+	};
+	if (typeof v !== "string") return {
+		type: "number",
+		value: v
+	};
+	if (WHOLE_REF.test(v.trim())) return {
+		type: "",
+		value: v.trim()
+	};
+	const d = deferred(v, c);
+	if (d !== void 0) return {
+		type: "dimension",
+		value: d
+	};
+	if (/^auto$/i.test(v.trim())) return void 0;
+	const m = NUM.exec(v);
+	if (!m) return {
+		type: "number",
+		value: evaluateExpression(v, "number") ?? v
+	};
+	const n = Number(m[1]);
+	const unit = m[2].toLowerCase();
+	if (unit === "%") return {
+		type: "number",
+		value: n / 100
+	};
+	if (unit === "" && n <= 4) return {
+		type: "number",
+		value: n
+	};
+	return {
+		type: "dimension",
+		value: {
+			value: n,
+			unit: unit || c.unit
+		}
+	};
+}
+function typography(v, c) {
+	if (!isObj$2(v)) return v;
+	const out = { ...v };
+	if (v.fontFamily !== void 0) out.fontFamily = fontFamily(v.fontFamily);
+	if (v.fontWeight !== void 0) out.fontWeight = fontWeight(v.fontWeight);
+	if (v.fontSize !== void 0) out.fontSize = dimension(v.fontSize, c);
+	if (v.letterSpacing !== void 0) out.letterSpacing = dimension(v.letterSpacing, c, "em");
+	if (v.lineHeight !== void 0) {
+		const lh = lineHeight(v.lineHeight, c);
+		if (lh) out.lineHeight = lh.value;
+		else delete out.lineHeight;
+	}
+	for (const k of ["paragraphSpacing", "paragraphIndent"]) if (v[k] !== void 0) out[k] = dimension(v[k], c);
+	return out;
+}
+function shadowLayer(v, c) {
+	if (!isObj$2(v)) return v;
+	const out = {
+		color: color(v.color, c),
+		offsetX: dimension(v.offsetX ?? v.x ?? 0, c),
+		offsetY: dimension(v.offsetY ?? v.y ?? 0, c),
+		blur: dimension(v.blur ?? 0, c),
+		spread: dimension(v.spread ?? 0, c)
+	};
+	if (v.inset !== void 0) out.inset = v.inset;
+	else if (v.type === "innerShadow") out.inset = true;
+	return out;
+}
+function border(v, c) {
+	if (!isObj$2(v)) return v;
+	const out = { ...v };
+	if (v.color !== void 0) out.color = color(v.color, c);
+	if (v.width !== void 0) out.width = dimension(v.width, c);
+	return out;
+}
+function duration(v) {
+	if (typeof v === "number") return {
+		value: v,
+		unit: "ms"
+	};
+	if (typeof v !== "string") return v;
+	const m = NUM.exec(v);
+	if (m && (m[2] === "" || m[2] === "ms" || m[2] === "s")) return {
+		value: Number(m[1]),
+		unit: m[2] || "ms"
+	};
+	return v;
+}
+/** Category/type/item naming: the first path segment says what an untyped token is. */
+function inferType(path, v, c) {
+	const category = path[0]?.toLowerCase();
+	if (category === "color" || category === "colors") return {
+		type: "color",
+		value: color(v, c)
+	};
+	if (category === "size" || category === "sizes") return {
+		type: "dimension",
+		value: dimension(v, {
+			...c,
+			unit: "rem"
+		})
+	};
+	if (category === "time") return {
+		type: "duration",
+		value: duration(v)
+	};
+	if (typeof v === "string" && !v.includes("{") || typeof v === "number") {
+		const t = cssValueToToken(path.join("-"), String(v));
+		if (t.$type === void 0 || t.$type === "css-expression" || String(v).includes("var(")) return {
+			type: "other",
+			value: v
+		};
+		return {
+			type: t.$type,
+			value: t.$value
+		};
+	}
+	return {
+		type: "other",
+		value: v
+	};
+}
+/**
+* One token's value in DTCG form, by its (source) type. References and expressions with
+* references stay as text for the core; everything literal becomes a DTCG value.
+*/
+function convertValue(sourceType, raw, path, c) {
+	const v = normalizeRefs(raw);
+	if (sourceType === "other" && typeof v === "string" && WHOLE_REF.test(v.trim())) return { value: v.trim() };
+	if (sourceType === "other" && (typeof v === "number" || typeof v === "string" && !v.includes("{"))) {
+		const t = inferType(path, v, c);
+		return t.type === "other" ? {
+			type: "other",
+			value: v
+		} : {
+			...t,
+			inferred: true
+		};
+	}
+	if (sourceType === void 0) {
+		if (typeof v === "string" && v.includes("{")) {
+			deferred(v, c);
+			return { value: v };
+		}
+		return {
+			...inferType(path, v, c),
+			inferred: true
+		};
+	}
+	const type = mapType(sourceType);
+	const css = (value) => typeof value === "string" && !value.includes("{") ? {
+		type: "css-expression",
+		value
+	} : {
+		type,
+		value
+	};
+	switch (type) {
+		case "color":
+			if (typeof v === "string" && /gradient\(/i.test(v)) return {
+				type: "css-expression",
+				value: v
+			};
+			return css(color(v, c));
+		case "dimension": return css(dimension(v, c, /letterSpacing/.test(mapKey(sourceType)) ? "em" : void 0));
+		case "number": return {
+			type,
+			value: numberValue(v, c)
+		};
+		case "fontFamily": return {
+			type,
+			value: fontFamily(v)
+		};
+		case "fontWeight": return {
+			type,
+			value: fontWeight(v)
+		};
+		case "lineHeight": {
+			const lh = lineHeight(v, c);
+			if (!lh) return {
+				type: sourceType,
+				value: v
+			};
+			return lh.type ? lh : { value: lh.value };
+		}
+		case "typography": return {
+			type,
+			value: typography(v, c)
+		};
+		case "shadow": return {
+			type,
+			value: Array.isArray(v) ? v.map((l) => shadowLayer(l, c)) : shadowLayer(v, c)
+		};
+		case "border": return {
+			type,
+			value: border(v, c)
+		};
+		case "duration": return {
+			type,
+			value: duration(v)
+		};
+		default:
+			if (typeof v === "string") deferred(v, c);
+			return {
+				type,
+				value: v
+			};
+	}
+}
+/** A group's `$type` in DTCG terms; undefined when it depends on each value (line heights). */
+const groupType = (sourceType) => {
+	const t = mapType(sourceType);
+	return t === "lineHeight" ? void 0 : t;
+};
+//#endregion
+//#region ../../node_modules/postcss/lib/stringifier.js
+var require_stringifier = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	const AT_NAME_END = /[\t\n\f\r "#'()/;[\\\]{}]/;
+	const DEFAULT_RAW = {
+		after: "\n",
+		beforeClose: "\n",
+		beforeComment: "\n",
+		beforeDecl: "\n",
+		beforeOpen: " ",
+		beforeRule: "\n",
+		colon: ": ",
+		commentLeft: " ",
+		commentRight: " ",
+		emptyBody: "",
+		indent: "    ",
+		semicolon: false
+	};
+	function capitalize(str) {
+		return str[0].toUpperCase() + str.slice(1);
+	}
+	function atruleStart(str, node) {
+		let name = "@" + node.name;
+		let params = node.params ? str.rawValue(node, "params") : "";
+		let afterName = node.raws.afterName;
+		if (typeof afterName === "undefined") afterName = params ? " " : "";
+		else if (afterName === "" && params && !AT_NAME_END.test(params[0])) afterName = " ";
+		return name + afterName + params;
+	}
+	function isCustomProperty(node) {
+		if (!node.prop.startsWith("--")) return false;
+		let before = node.raws.before;
+		return typeof before === "undefined" || !/[^\s;]$/.test(before);
+	}
+	function pushBody(str, stack, node) {
+		let nodes = node.nodes;
+		let last = nodes.length - 1;
+		while (last > 0) {
+			if (nodes[last].type !== "comment") break;
+			last -= 1;
+		}
+		let semicolon = str.raw(node, "semicolon");
+		let isDocument = node.type === "document";
+		for (let i = nodes.length - 1; i >= 0; i--) {
+			let child = nodes[i];
+			let childSemicolon = last !== i || semicolon;
+			if (!childSemicolon && i < nodes.length - 1 && (child.type === "atrule" && !child.nodes || child.type === "decl" && isCustomProperty(child))) childSemicolon = true;
+			stack.push({
+				document: isDocument,
+				node: child,
+				semicolon: childSemicolon
+			});
+		}
+	}
+	function pushBlock(str, stack, node, start) {
+		let between = str.raw(node, "between", "beforeOpen");
+		str.builder(start + between + "{", node, "start");
+		let hasNodes = node.nodes && node.nodes.length;
+		let close = () => {
+			let after = hasNodes ? str.raw(node, "after") : str.raw(node, "after", "emptyBody");
+			if (after) str.builder(after);
+			str.builder("}", node, "end");
+			if (node.type === "rule" && node.raws.ownSemicolon) str.builder(node.raws.ownSemicolon, node, "end");
+		};
+		if (hasNodes) {
+			stack.push(close);
+			pushBody(str, stack, node);
+		} else close();
+	}
+	var Stringifier = class Stringifier {
+		constructor(builder) {
+			this.builder = builder;
+		}
+		atrule(node, semicolon) {
+			let start = atruleStart(this, node);
+			if (node.nodes) this.block(node, start);
+			else {
+				let end = (node.raws.between || "") + (semicolon ? ";" : "");
+				this.builder(start + end, node);
+			}
+		}
+		beforeAfter(node, detect) {
+			let value;
+			if (node.type === "decl") value = this.raw(node, null, "beforeDecl");
+			else if (node.type === "comment") value = this.raw(node, null, "beforeComment");
+			else if (detect === "before") value = this.raw(node, null, "beforeRule");
+			else value = this.raw(node, null, "beforeClose");
+			let buf = node.parent;
+			let depth = 0;
+			while (buf && buf.type !== "root") {
+				depth += 1;
+				buf = buf.parent;
+			}
+			if (value.includes("\n")) {
+				let indent = this.raw(node, null, "indent");
+				if (indent.length) for (let step = 0; step < depth; step++) value += indent;
+			}
+			return value;
+		}
+		block(node, start) {
+			let between = this.raw(node, "between", "beforeOpen");
+			this.builder(start + between + "{", node, "start");
+			let after;
+			if (node.nodes && node.nodes.length) {
+				this.body(node);
+				after = this.raw(node, "after");
+			} else after = this.raw(node, "after", "emptyBody");
+			if (after) this.builder(after);
+			this.builder("}", node, "end");
+		}
+		body(node) {
+			let proto = Stringifier.prototype;
+			let expandable = [
+				"atrule",
+				"block",
+				"body",
+				"rule",
+				"stringify"
+			].every((method) => this[method] === proto[method]);
+			let stack = [];
+			pushBody(this, stack, node);
+			while (stack.length > 0) {
+				let entry = stack.pop();
+				if (typeof entry === "function") {
+					entry();
+					continue;
+				}
+				let child = entry.node;
+				let before = this.raw(child, "before");
+				if (before) this.builder(before);
+				if (expandable && child.type === "rule") pushBlock(this, stack, child, this.rawValue(child, "selector"));
+				else if (expandable && child.type === "atrule" && child.nodes) pushBlock(this, stack, child, atruleStart(this, child));
+				else this.stringify(child, entry.semicolon);
+			}
+		}
+		comment(node) {
+			let left = this.raw(node, "left", "commentLeft");
+			let right = this.raw(node, "right", "commentRight");
+			this.builder("/*" + left + node.text + right + "*/", node);
+		}
+		decl(node, semicolon) {
+			let raws = node.raws;
+			let between = this.raw(node, "between", "colon");
+			let string = node.prop + between + this.rawValue(node, "value");
+			if (node.important) string += raws.important || " !important";
+			if (semicolon) string += ";";
+			this.builder(string, node);
+		}
+		document(node) {
+			this.body(node);
+		}
+		raw(node, own, detect) {
+			let value;
+			if (!detect) detect = own;
+			if (own) {
+				value = node.raws[own];
+				if (typeof value !== "undefined") return value;
+			}
+			let parent = node.parent;
+			if (detect === "before") {
+				if (!parent || parent.type === "root" && parent.first === node) return "";
+				if (parent && parent.type === "document") return "";
+			}
+			if (!parent) return DEFAULT_RAW[detect];
+			let root = node.root();
+			let cache = root.rawCache || (root.rawCache = {});
+			if (typeof cache[detect] !== "undefined") return cache[detect];
+			if (detect === "before" || detect === "after") return this.beforeAfter(node, detect);
+			else {
+				let method = "raw" + capitalize(detect);
+				if (this[method]) value = this[method](root, node);
+				else root.walk((i) => {
+					value = i.raws[own];
+					if (typeof value !== "undefined") return false;
+				});
+			}
+			if (typeof value === "undefined") value = DEFAULT_RAW[detect];
+			cache[detect] = value;
+			return value;
+		}
+		rawBeforeClose(root) {
+			let value;
+			root.walk((i) => {
+				if (i.nodes && i.nodes.length > 0) {
+					if (typeof i.raws.after !== "undefined") {
+						value = i.raws.after;
+						if (value.includes("\n")) value = value.replace(/[^\n]+$/, "");
+						return false;
+					}
+				}
+			});
+			if (value) value = value.replace(/\S/g, "");
+			return value;
+		}
+		rawBeforeComment(root, node) {
+			let value;
+			root.walkComments((i) => {
+				if (typeof i.raws.before !== "undefined") {
+					value = i.raws.before;
+					if (value.includes("\n")) value = value.replace(/[^\n]+$/, "");
+					return false;
+				}
+			});
+			if (typeof value === "undefined") value = this.raw(node, null, "beforeDecl");
+			else if (value) value = value.replace(/\S/g, "");
+			return value;
+		}
+		rawBeforeDecl(root, node) {
+			let value;
+			root.walkDecls((i) => {
+				if (typeof i.raws.before !== "undefined") {
+					value = i.raws.before;
+					if (value.includes("\n")) value = value.replace(/[^\n]+$/, "");
+					return false;
+				}
+			});
+			if (typeof value === "undefined") value = this.raw(node, null, "beforeRule");
+			else if (value) value = value.replace(/\S/g, "");
+			return value;
+		}
+		rawBeforeOpen(root) {
+			let value;
+			root.walk((i) => {
+				if (i.type !== "decl") {
+					value = i.raws.between;
+					if (typeof value !== "undefined") return false;
+				}
+			});
+			return value;
+		}
+		rawBeforeRule(root) {
+			let value;
+			root.walk((i) => {
+				if (i.nodes && (i.parent !== root || root.first !== i)) {
+					if (typeof i.raws.before !== "undefined") {
+						value = i.raws.before;
+						if (value.includes("\n")) value = value.replace(/[^\n]+$/, "");
+						return false;
+					}
+				}
+			});
+			if (value) value = value.replace(/\S/g, "");
+			return value;
+		}
+		rawColon(root) {
+			let value;
+			root.walkDecls((i) => {
+				if (typeof i.raws.between !== "undefined") {
+					value = i.raws.between.replace(/[^\s:]/g, "");
+					return false;
+				}
+			});
+			return value;
+		}
+		rawEmptyBody(root) {
+			let value;
+			root.walk((i) => {
+				if (i.nodes && i.nodes.length === 0) {
+					value = i.raws.after;
+					if (typeof value !== "undefined") return false;
+				}
+			});
+			return value;
+		}
+		rawIndent(root) {
+			if (root.raws.indent) return root.raws.indent;
+			let value;
+			root.walk((i) => {
+				let p = i.parent;
+				if (p && p !== root && p.parent && p.parent === root) {
+					if (typeof i.raws.before !== "undefined") {
+						let parts = i.raws.before.split("\n");
+						value = parts[parts.length - 1];
+						value = value.replace(/\S/g, "");
+						return false;
+					}
+				}
+			});
+			return value;
+		}
+		rawSemicolon(root) {
+			let value;
+			root.walk((i) => {
+				if (i.nodes && i.nodes.length && i.last.type === "decl") {
+					value = i.raws.semicolon;
+					if (typeof value !== "undefined") return false;
+				}
+			});
+			return value;
+		}
+		rawValue(node, prop) {
+			let value = node[prop];
+			let raw = node.raws[prop];
+			if (raw && raw.value === value) return raw.raw;
+			return value;
+		}
+		root(node) {
+			if (!(node.parent && node.parent.type === "document") && node.source && node.source.input.hasBOM) this.builder("﻿", node, "start");
+			this.body(node);
+			if (node.raws.after) this.builder(node.raws.after);
+		}
+		rule(node) {
+			this.block(node, this.rawValue(node, "selector"));
+			if (node.raws.ownSemicolon) this.builder(node.raws.ownSemicolon, node, "end");
+		}
+		stringify(node, semicolon) {
+			/* c8 ignore start */
+			if (!this[node.type]) throw new Error("Unknown AST node type " + node.type + ". Maybe you need to change PostCSS stringifier.");
+			/* c8 ignore stop */
+			this[node.type](node, semicolon);
+		}
+	};
+	module.exports = Stringifier;
+	Stringifier.default = Stringifier;
+}));
+//#endregion
+//#region ../../node_modules/postcss-scss/lib/scss-stringifier.js
+var require_scss_stringifier = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Stringifier = require_stringifier();
+	var ScssStringifier = class extends Stringifier {
+		comment(node) {
+			let left = this.raw(node, "left", "commentLeft");
+			let right = this.raw(node, "right", "commentRight");
+			if (node.raws.inline) {
+				let text = node.raws.text || node.text;
+				this.builder("//" + left + text + right, node);
+			} else this.builder("/*" + left + node.text + right + "*/", node);
+		}
+		decl(node, semicolon) {
+			if (!node.isNested) super.decl(node, semicolon);
+			else {
+				let between = this.raw(node, "between", "colon");
+				let string = node.prop + between + this.rawValue(node, "value");
+				if (node.important) string += node.raws.important || " !important";
+				this.builder(string + "{", node, "start");
+				let after;
+				if (node.nodes && node.nodes.length) {
+					this.body(node);
+					after = this.raw(node, "after");
+				} else after = this.raw(node, "after", "emptyBody");
+				if (after) this.builder(after);
+				this.builder("}", node, "end");
+			}
+		}
+		rawValue(node, prop) {
+			let value = node[prop];
+			let raw = node.raws[prop];
+			if (raw && raw.value === value) return raw.scss ? raw.scss : raw.raw;
+			else return value;
+		}
+	};
+	module.exports = ScssStringifier;
+}));
+//#endregion
+//#region ../../node_modules/postcss-scss/lib/scss-stringify.js
+var require_scss_stringify = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let ScssStringifier = require_scss_stringifier();
+	module.exports = function scssStringify(node, builder) {
+		new ScssStringifier(builder).stringify(node);
+	};
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/tokenize.js
+var require_tokenize = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	const SINGLE_QUOTE = "'".charCodeAt(0);
+	const DOUBLE_QUOTE = "\"".charCodeAt(0);
+	const BACKSLASH = "\\".charCodeAt(0);
+	const SLASH = "/".charCodeAt(0);
+	const NEWLINE = "\n".charCodeAt(0);
+	const SPACE = " ".charCodeAt(0);
+	const FEED = "\f".charCodeAt(0);
+	const TAB = "	".charCodeAt(0);
+	const CR = "\r".charCodeAt(0);
+	const OPEN_SQUARE = "[".charCodeAt(0);
+	const CLOSE_SQUARE = "]".charCodeAt(0);
+	const OPEN_PARENTHESES = "(".charCodeAt(0);
+	const CLOSE_PARENTHESES = ")".charCodeAt(0);
+	const OPEN_CURLY = "{".charCodeAt(0);
+	const CLOSE_CURLY = "}".charCodeAt(0);
+	const SEMICOLON = ";".charCodeAt(0);
+	const ASTERISK = "*".charCodeAt(0);
+	const COLON = ":".charCodeAt(0);
+	const AT = "@".charCodeAt(0);
+	const RE_AT_END = /[\t\n\f\r "#'()/;[\\\]{}]/g;
+	const RE_WORD_END = /[\t\n\f\r !"#'():;@[\\\]{}]|\/(?=\*)/g;
+	const RE_BAD_BRACKET = /.[\r\n"'(/\\]/;
+	const RE_HEX_ESCAPE = /[\da-f]/i;
+	module.exports = function tokenizer(input, options = {}) {
+		let css = input.css.valueOf();
+		let ignore = options.ignoreErrors;
+		let code, content, escape, next, quote;
+		let currentToken, escaped, escapePos, n, prev;
+		let length = css.length;
+		let pos = 0;
+		let buffer = [];
+		let returned = [];
+		let lastBadParen = -1;
+		function position() {
+			return pos;
+		}
+		function unclosed(what) {
+			throw input.error("Unclosed " + what, pos);
+		}
+		function endOfFile() {
+			return returned.length === 0 && pos >= length;
+		}
+		function nextToken(opts) {
+			if (returned.length) return returned.pop();
+			if (pos >= length) return;
+			let ignoreUnclosed = opts ? opts.ignoreUnclosed : false;
+			code = css.charCodeAt(pos);
+			switch (code) {
+				case NEWLINE:
+				case SPACE:
+				case TAB:
+				case CR:
+				case FEED:
+					next = pos;
+					do {
+						next += 1;
+						code = css.charCodeAt(next);
+					} while (code === SPACE || code === NEWLINE || code === TAB || code === CR || code === FEED);
+					currentToken = ["space", css.slice(pos, next)];
+					pos = next - 1;
+					break;
+				case OPEN_SQUARE:
+				case CLOSE_SQUARE:
+				case OPEN_CURLY:
+				case CLOSE_CURLY:
+				case COLON:
+				case SEMICOLON:
+				case CLOSE_PARENTHESES: {
+					let controlChar = String.fromCharCode(code);
+					currentToken = [
+						controlChar,
+						controlChar,
+						pos
+					];
+					break;
+				}
+				case OPEN_PARENTHESES:
+					prev = buffer.length ? buffer.pop()[1] : "";
+					n = css.charCodeAt(pos + 1);
+					if (prev === "url" && n !== SINGLE_QUOTE && n !== DOUBLE_QUOTE && n !== SPACE && n !== NEWLINE && n !== TAB && n !== FEED && n !== CR) {
+						next = pos;
+						do {
+							escaped = false;
+							next = css.indexOf(")", next + 1);
+							if (next === -1) {
+								if (ignore || ignoreUnclosed) {
+									next = pos;
+									break;
+								} else unclosed("bracket");
+							}
+							escapePos = next;
+							while (css.charCodeAt(escapePos - 1) === BACKSLASH) {
+								escapePos -= 1;
+								escaped = !escaped;
+							}
+						} while (escaped);
+						currentToken = [
+							"brackets",
+							css.slice(pos, next + 1),
+							pos,
+							next
+						];
+						pos = next;
+					} else if (pos <= lastBadParen) currentToken = [
+						"(",
+						"(",
+						pos
+					];
+					else {
+						next = css.indexOf(")", pos + 1);
+						content = css.slice(pos, next + 1);
+						if (next === -1 || RE_BAD_BRACKET.test(content)) {
+							lastBadParen = next === -1 ? length : next;
+							currentToken = [
+								"(",
+								"(",
+								pos
+							];
+						} else {
+							currentToken = [
+								"brackets",
+								content,
+								pos,
+								next
+							];
+							pos = next;
+						}
+					}
+					break;
+				case SINGLE_QUOTE:
+				case DOUBLE_QUOTE:
+					quote = code === SINGLE_QUOTE ? "'" : "\"";
+					next = pos;
+					do {
+						escaped = false;
+						next = css.indexOf(quote, next + 1);
+						if (next === -1) {
+							if (ignore || ignoreUnclosed) {
+								next = pos + 1;
+								break;
+							} else unclosed("string");
+						}
+						escapePos = next;
+						while (css.charCodeAt(escapePos - 1) === BACKSLASH) {
+							escapePos -= 1;
+							escaped = !escaped;
+						}
+					} while (escaped);
+					currentToken = [
+						"string",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+					break;
+				case AT:
+					RE_AT_END.lastIndex = pos + 1;
+					RE_AT_END.test(css);
+					if (RE_AT_END.lastIndex === 0) next = css.length - 1;
+					else next = RE_AT_END.lastIndex - 2;
+					currentToken = [
+						"at-word",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+					break;
+				case BACKSLASH:
+					next = pos;
+					escape = true;
+					while (css.charCodeAt(next + 1) === BACKSLASH) {
+						next += 1;
+						escape = !escape;
+					}
+					code = css.charCodeAt(next + 1);
+					if (escape && code !== SLASH && code !== SPACE && code !== NEWLINE && code !== TAB && code !== CR && code !== FEED) {
+						next += 1;
+						if (RE_HEX_ESCAPE.test(css.charAt(next))) {
+							while (RE_HEX_ESCAPE.test(css.charAt(next + 1))) next += 1;
+							if (css.charCodeAt(next + 1) === SPACE) next += 1;
+						}
+					}
+					currentToken = [
+						"word",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+					break;
+				default: if (code === SLASH && css.charCodeAt(pos + 1) === ASTERISK) {
+					next = css.indexOf("*/", pos + 2) + 1;
+					if (next === 0) {
+						if (ignore || ignoreUnclosed) next = css.length;
+						else unclosed("comment");
+					}
+					currentToken = [
+						"comment",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+				} else {
+					RE_WORD_END.lastIndex = pos + 1;
+					RE_WORD_END.test(css);
+					if (RE_WORD_END.lastIndex === 0) next = css.length - 1;
+					else next = RE_WORD_END.lastIndex - 2;
+					currentToken = [
+						"word",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					buffer.push(currentToken);
+					pos = next;
+				}
+			}
+			pos++;
+			return currentToken;
+		}
+		function back(token) {
+			returned.push(token);
+		}
+		return {
+			back,
+			endOfFile,
+			nextToken,
+			position
+		};
+	};
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/terminal-highlight.js
+var require_terminal_highlight = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let pico = require_picocolors();
+	let tokenizer = require_tokenize();
+	let Input;
+	function registerInput(dependant) {
+		Input = dependant;
+	}
+	const HIGHLIGHT_THEME = {
+		";": pico.yellow,
+		":": pico.yellow,
+		"(": pico.cyan,
+		")": pico.cyan,
+		"[": pico.yellow,
+		"]": pico.yellow,
+		"{": pico.yellow,
+		"}": pico.yellow,
+		"at-word": pico.cyan,
+		"brackets": pico.cyan,
+		"call": pico.cyan,
+		"class": pico.yellow,
+		"comment": pico.gray,
+		"hash": pico.magenta,
+		"string": pico.green
+	};
+	function getTokenType([type, value], processor) {
+		if (type === "word") {
+			if (value[0] === ".") return "class";
+			if (value[0] === "#") return "hash";
+		}
+		if (!processor.endOfFile()) {
+			let next = processor.nextToken();
+			processor.back(next);
+			if (next[0] === "brackets" || next[0] === "(") return "call";
+		}
+		return type;
+	}
+	function terminalHighlight(css) {
+		let processor = tokenizer(new Input(css), { ignoreErrors: true });
+		let result = "";
+		while (!processor.endOfFile()) {
+			let token = processor.nextToken();
+			let color = HIGHLIGHT_THEME[getTokenType(token, processor)];
+			if (color) result += token[1].split(/\r?\n/).map((i) => color(i)).join("\n");
+			else result += token[1];
+		}
+		return result;
+	}
+	terminalHighlight.registerInput = registerInput;
+	module.exports = terminalHighlight;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/css-syntax-error.js
+var require_css_syntax_error = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let pico = require_picocolors();
+	let terminalHighlight = require_terminal_highlight();
+	var CssSyntaxError = class CssSyntaxError extends Error {
+		constructor(message, line, column, source, file, plugin) {
+			super(message);
+			this.name = "CssSyntaxError";
+			this.reason = message;
+			if (file) this.file = file;
+			if (source) this.source = source;
+			if (plugin) this.plugin = plugin;
+			if (typeof line !== "undefined" && typeof column !== "undefined") {
+				if (typeof line === "number") {
+					this.line = line;
+					this.column = column;
+				} else {
+					this.line = line.line;
+					this.column = line.column;
+					this.endLine = column.line;
+					this.endColumn = column.column;
+				}
+			}
+			this.setMessage();
+			if (Error.captureStackTrace) Error.captureStackTrace(this, CssSyntaxError);
+		}
+		setMessage() {
+			this.message = this.plugin ? this.plugin + ": " : "";
+			this.message += this.file ? this.file : "<css input>";
+			if (typeof this.line !== "undefined") this.message += ":" + this.line + ":" + this.column;
+			this.message += ": " + this.reason;
+		}
+		showSourceCode(color) {
+			if (!this.source) return "";
+			let css = this.source;
+			if (color == null) color = pico.isColorSupported;
+			let aside = (text) => text;
+			let mark = (text) => text;
+			let highlight = (text) => text;
+			if (color) {
+				let { bold, gray, red } = pico.createColors(true);
+				mark = (text) => bold(red(text));
+				aside = (text) => gray(text);
+				if (terminalHighlight) highlight = (text) => terminalHighlight(text);
+			}
+			let lines = css.split(/\r?\n/);
+			let start = Math.max(this.line - 3, 0);
+			let end = Math.min(this.line + 2, lines.length);
+			let maxWidth = String(end).length;
+			return lines.slice(start, end).map((line, index) => {
+				let number = start + 1 + index;
+				let gutter = " " + (" " + number).slice(-maxWidth) + " | ";
+				if (number === this.line) {
+					if (line.length > 160) {
+						let padding = 20;
+						let subLineStart = Math.max(0, this.column - padding);
+						let subLineEnd = Math.max(this.column + padding, this.endColumn + padding);
+						let subLine = line.slice(subLineStart, subLineEnd);
+						let spacing = aside(gutter.replace(/\d/g, " ")) + line.slice(0, Math.min(this.column - 1, 19)).replace(/[^\t]/g, " ");
+						return mark(">") + aside(gutter) + highlight(subLine) + "\n " + spacing + mark("^");
+					}
+					let spacing = aside(gutter.replace(/\d/g, " ")) + line.slice(0, this.column - 1).replace(/[^\t]/g, " ");
+					return mark(">") + aside(gutter) + highlight(line) + "\n " + spacing + mark("^");
+				}
+				return " " + aside(gutter) + highlight(line);
+			}).join("\n");
+		}
+		toString() {
+			let code = this.showSourceCode();
+			if (code) code = "\n\n" + code + "\n";
+			return this.name + ": " + this.message + code;
+		}
+	};
+	module.exports = CssSyntaxError;
+	CssSyntaxError.default = CssSyntaxError;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/stringify.js
+var require_stringify = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Stringifier = require_stringifier();
+	const STYLE_TAG = /(<)(\/?style\b)/gi;
+	const COMMENT_OPEN = /(<)(!--)/g;
+	function escapeHTMLInCSS(str) {
+		if (!str.includes("<")) return str;
+		return str.replace(STYLE_TAG, "\\3c $2").replace(COMMENT_OPEN, "\\3c $2");
+	}
+	var SafeStringifier = class extends Stringifier {
+		escapeHTML(node, print) {
+			let builder = this.builder;
+			let chunks, css;
+			this.builder = (str, child, type) => {
+				if (chunks) {
+					css += str;
+					chunks.push(str, child, type);
+				} else if (str.includes("<")) {
+					css = str;
+					chunks = [
+						str,
+						child,
+						type
+					];
+				} else builder(str, child, type);
+			};
+			print();
+			this.builder = builder;
+			if (!chunks) return;
+			let escaped = escapeHTMLInCSS(css);
+			if (escaped === css) for (let i = 0; i < chunks.length; i += 3) builder(chunks[i], chunks[i + 1], chunks[i + 2]);
+			else builder(escaped, node);
+		}
+		root(node) {
+			if (node.parent && node.parent.type === "document") {
+				this.escapeHTML(node, () => this.body(node));
+				if (node.raws.after) this.builder(node.raws.after);
+			} else this.escapeHTML(node, () => super.root(node));
+		}
+	};
+	function stringify(node, builder) {
+		let str = new SafeStringifier(builder);
+		if (node.type === "root" || node.type === "document") str.stringify(node);
+		else str.escapeHTML(node, () => str.stringify(node));
+	}
+	module.exports = stringify;
+	stringify.default = stringify;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/symbols.js
+var require_symbols = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	module.exports.isClean = Symbol("isClean");
+	module.exports.my = Symbol("my");
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/node.js
+var require_node = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let CssSyntaxError = require_css_syntax_error();
+	let Stringifier = require_stringifier();
+	let stringify = require_stringify();
+	let { isClean, my } = require_symbols();
+	function cloneNode(obj, parent) {
+		let cloned = new obj.constructor();
+		let stack = [[
+			obj,
+			cloned,
+			parent
+		]];
+		while (stack.length > 0) {
+			let [source, target, targetParent] = stack.pop();
+			for (let i in source) {
+				if (!Object.prototype.hasOwnProperty.call(source, i))
+ /* c8 ignore next 2 */
+				continue;
+				if (i === "proxyCache") continue;
+				let value = source[i];
+				let type = typeof value;
+				if (i === "parent" && type === "object") {
+					if (targetParent) target[i] = targetParent;
+				} else if (i === "source") target[i] = value;
+				else if (Array.isArray(value)) {
+					let children = [];
+					target[i] = children;
+					for (let j of value) {
+						let childClone = new j.constructor();
+						children.push(childClone);
+						stack.push([
+							j,
+							childClone,
+							target
+						]);
+					}
+				} else {
+					if (type === "object" && value !== null) {
+						let valueClone = new value.constructor();
+						stack.push([
+							value,
+							valueClone,
+							void 0
+						]);
+						value = valueClone;
+					}
+					target[i] = value;
+				}
+			}
+		}
+		return cloned;
+	}
+	function sourceOffset(inputCSS, position) {
+		if (position && typeof position.offset !== "undefined") return position.offset;
+		let column = 1;
+		let line = 1;
+		let offset = 0;
+		for (let i = 0; i < inputCSS.length; i++) {
+			if (line === position.line && column === position.column) {
+				offset = i;
+				break;
+			}
+			if (inputCSS[i] === "\n") {
+				column = 1;
+				line += 1;
+			} else column += 1;
+		}
+		return offset;
+	}
+	var Node = class Node {
+		get proxyOf() {
+			return this;
+		}
+		constructor(defaults = {}) {
+			this.raws = {};
+			this[isClean] = false;
+			this[my] = true;
+			for (let name of Object.keys(defaults)) {
+				if (name === "__proto__") continue;
+				if (name === "nodes") {
+					this.nodes = [];
+					for (let node of defaults[name]) if (typeof node.clone === "function" && node.parent) this.append(node.clone());
+					else this.append(node);
+				} else this[name] = defaults[name];
+			}
+		}
+		addToError(error) {
+			error.postcssNode = this;
+			if (error.stack && this.source && /\n\s{4}at /.test(error.stack)) {
+				let s = this.source;
+				error.stack = error.stack.replace(/\n\s{4}at /, `$&${s.input.from}:${s.start.line}:${s.start.column}$&`);
+			}
+			return error;
+		}
+		after(add) {
+			this.parent.insertAfter(this, add);
+			return this;
+		}
+		assign(overrides = {}) {
+			for (let name in overrides) this[name] = overrides[name];
+			return this;
+		}
+		before(add) {
+			this.parent.insertBefore(this, add);
+			return this;
+		}
+		cleanRaws(keepBetween) {
+			delete this.raws.before;
+			delete this.raws.after;
+			if (!keepBetween) delete this.raws.between;
+		}
+		clone(overrides = {}) {
+			let cloned = cloneNode(this);
+			for (let name in overrides) cloned[name] = overrides[name];
+			return cloned;
+		}
+		cloneAfter(overrides = {}) {
+			let cloned = this.clone(overrides);
+			this.parent.insertAfter(this, cloned);
+			return cloned;
+		}
+		cloneBefore(overrides = {}) {
+			let cloned = this.clone(overrides);
+			this.parent.insertBefore(this, cloned);
+			return cloned;
+		}
+		error(message, opts = {}) {
+			if (this.source) {
+				let { end, start } = this.rangeBy(opts);
+				return this.source.input.error(message, {
+					column: start.column,
+					line: start.line
+				}, {
+					column: end.column,
+					line: end.line
+				}, opts);
+			}
+			return new CssSyntaxError(message);
+		}
+		getProxyProcessor() {
+			return {
+				get(node, prop) {
+					if (prop === "proxyOf") return node;
+					else if (prop === "root") return () => node.root().toProxy();
+					else return node[prop];
+				},
+				set(node, prop, value) {
+					if (node[prop] === value) return true;
+					node[prop] = value;
+					if (prop === "prop" || prop === "value" || prop === "name" || prop === "params" || prop === "important" || 
+					/* c8 ignore next */
+					prop === "text") node.markDirty();
+					return true;
+				}
+			};
+		}
+		/* c8 ignore next 3 */
+		markClean() {
+			this[isClean] = true;
+		}
+		markDirty() {
+			if (this[isClean]) {
+				this[isClean] = false;
+				let next = this;
+				while (next = next.parent) next[isClean] = false;
+			}
+		}
+		next() {
+			if (!this.parent) return void 0;
+			let index = this.parent.index(this);
+			return this.parent.nodes[index + 1];
+		}
+		positionBy(opts = {}) {
+			let inputString = "document" in this.source.input ? this.source.input.document : this.source.input.css;
+			let pos = {
+				column: this.source.start.column,
+				line: this.source.start.line,
+				offset: sourceOffset(inputString, this.source.start)
+			};
+			if (opts.index) pos = this.positionInside(opts.index);
+			else if (opts.word) {
+				let index = inputString.slice(sourceOffset(inputString, this.source.start), sourceOffset(inputString, this.source.end)).indexOf(opts.word);
+				if (index !== -1) pos = this.positionInside(index);
+			}
+			return pos;
+		}
+		positionInside(index) {
+			let column = this.source.start.column;
+			let line = this.source.start.line;
+			let inputString = "document" in this.source.input ? this.source.input.document : this.source.input.css;
+			let offset = sourceOffset(inputString, this.source.start);
+			let end = offset + index;
+			for (let i = offset; i < end; i++) if (inputString[i] === "\n") {
+				column = 1;
+				line += 1;
+			} else column += 1;
+			return {
+				column,
+				line,
+				offset: end
+			};
+		}
+		prev() {
+			if (!this.parent) return void 0;
+			let index = this.parent.index(this);
+			return this.parent.nodes[index - 1];
+		}
+		rangeBy(opts = {}) {
+			let inputString = "document" in this.source.input ? this.source.input.document : this.source.input.css;
+			let start = {
+				column: this.source.start.column,
+				line: this.source.start.line,
+				offset: sourceOffset(inputString, this.source.start)
+			};
+			let end = this.source.end ? {
+				column: this.source.end.column + 1,
+				line: this.source.end.line,
+				offset: typeof this.source.end.offset === "number" ? this.source.end.offset : sourceOffset(inputString, this.source.end) + 1
+			} : {
+				column: start.column + 1,
+				line: start.line,
+				offset: start.offset + 1
+			};
+			if (opts.word) {
+				let index = inputString.slice(sourceOffset(inputString, this.source.start), sourceOffset(inputString, this.source.end)).indexOf(opts.word);
+				if (index !== -1) {
+					start = this.positionInside(index);
+					end = this.positionInside(index + opts.word.length);
+				}
+			} else {
+				if (opts.start) start = {
+					column: opts.start.column,
+					line: opts.start.line,
+					offset: sourceOffset(inputString, opts.start)
+				};
+				else if (typeof opts.index === "number") start = this.positionInside(opts.index);
+				if (opts.end) end = {
+					column: opts.end.column,
+					line: opts.end.line,
+					offset: sourceOffset(inputString, opts.end)
+				};
+				else if (typeof opts.endIndex === "number") end = this.positionInside(opts.endIndex);
+				else if (typeof opts.index === "number") end = this.positionInside(opts.index + 1);
+			}
+			if (end.line < start.line || end.line === start.line && end.column <= start.column) end = {
+				column: start.column + 1,
+				line: start.line,
+				offset: start.offset + 1
+			};
+			return {
+				end,
+				start
+			};
+		}
+		raw(prop, defaultType) {
+			return new Stringifier().raw(this, prop, defaultType);
+		}
+		remove() {
+			if (this.parent) this.parent.removeChild(this);
+			this.parent = void 0;
+			return this;
+		}
+		replaceWith(...nodes) {
+			if (this.parent) {
+				let bookmark = this;
+				let foundSelf = false;
+				for (let node of nodes) if (node === this) foundSelf = true;
+				else if (foundSelf) {
+					this.parent.insertAfter(bookmark, node);
+					bookmark = node;
+				} else this.parent.insertBefore(bookmark, node);
+				if (!foundSelf) this.remove();
+			}
+			return this;
+		}
+		root() {
+			let result = this;
+			while (result.parent && result.parent.type !== "document") result = result.parent;
+			return result;
+		}
+		toJSON(_, inputs) {
+			let emitInputs = inputs == null;
+			inputs = inputs || /* @__PURE__ */ new Map();
+			let holderOfRoot = [];
+			let queue = [[
+				this,
+				holderOfRoot,
+				0
+			]];
+			for (let step = 0; step < queue.length; step++) {
+				let [node, holder, key] = queue[step];
+				let fixed = {};
+				holder[key] = fixed;
+				for (let name in node) {
+					if (!Object.prototype.hasOwnProperty.call(node, name))
+ /* c8 ignore next 2 */
+					continue;
+					if (name === "parent" || name === "proxyCache") continue;
+					let value = node[name];
+					if (Array.isArray(value)) {
+						let fixedArray = [];
+						fixed[name] = fixedArray;
+						for (let i = 0; i < value.length; i++) {
+							let item = value[i];
+							if (typeof item === "object" && item.toJSON) {
+								if (item.toJSON === Node.prototype.toJSON) queue.push([
+									item,
+									fixedArray,
+									i
+								]);
+								else fixedArray[i] = item.toJSON(null, inputs);
+							} else fixedArray[i] = item;
+						}
+					} else if (typeof value === "object" && value.toJSON) {
+						if (value.toJSON === Node.prototype.toJSON) queue.push([
+							value,
+							fixed,
+							name
+						]);
+						else fixed[name] = value.toJSON(null, inputs);
+					} else if (name === "source") {
+						if (value == null) continue;
+						let inputId = inputs.get(value.input);
+						if (inputId == null) {
+							inputId = inputs.size;
+							inputs.set(value.input, inputId);
+						}
+						fixed[name] = {
+							end: value.end,
+							inputId,
+							start: value.start
+						};
+					} else fixed[name] = value;
+				}
+			}
+			let fixed = holderOfRoot[0];
+			if (emitInputs) fixed.inputs = [...inputs.keys()].map((input) => input.toJSON());
+			return fixed;
+		}
+		toProxy() {
+			if (!this.proxyCache) this.proxyCache = new Proxy(this, this.getProxyProcessor());
+			return this.proxyCache;
+		}
+		toString(stringifier = stringify) {
+			if (stringifier.stringify) stringifier = stringifier.stringify;
+			let result = "";
+			stringifier(this, (i) => {
+				result += i;
+			});
+			return result;
+		}
+		warn(result, text, opts = {}) {
+			let data = { node: this };
+			for (let i in opts) data[i] = opts[i];
+			return result.warn(text, data);
+		}
+	};
+	module.exports = Node;
+	Node.default = Node;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/comment.js
+var require_comment = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Node = require_node();
+	var Comment = class extends Node {
+		constructor(defaults) {
+			super(defaults);
+			this.type = "comment";
+		}
+	};
+	module.exports = Comment;
+	Comment.default = Comment;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/declaration.js
+var require_declaration = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Node = require_node();
+	var Declaration = class extends Node {
+		get variable() {
+			return this.prop.startsWith("--") || this.prop[0] === "$";
+		}
+		constructor(defaults) {
+			if (defaults && typeof defaults.value !== "undefined" && typeof defaults.value !== "string") defaults = {
+				...defaults,
+				value: String(defaults.value)
+			};
+			super(defaults);
+			this.type = "decl";
+		}
+	};
+	module.exports = Declaration;
+	Declaration.default = Declaration;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/container.js
+var require_container = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Comment = require_comment();
+	let Declaration = require_declaration();
+	let Node = require_node();
+	let { isClean, my } = require_symbols();
+	let AtRule;
+	let parse;
+	let Root;
+	let Rule;
+	function cleanSource(nodes) {
+		let stack = nodes.slice();
+		while (stack.length > 0) {
+			let node = stack.pop();
+			delete node.source;
+			if (node.nodes) {
+				node.nodes = node.nodes.slice();
+				for (let i of node.nodes) stack.push(i);
+			}
+		}
+		return nodes.slice();
+	}
+	function markTreeDirty(node) {
+		let stack = [node];
+		while (stack.length > 0) {
+			let next = stack.pop();
+			next[isClean] = false;
+			if (next.proxyOf.nodes) for (let i of next.proxyOf.nodes) stack.push(i);
+		}
+	}
+	var Container = class Container extends Node {
+		get first() {
+			if (!this.proxyOf.nodes) return void 0;
+			return this.proxyOf.nodes[0];
+		}
+		get last() {
+			if (!this.proxyOf.nodes) return void 0;
+			return this.proxyOf.nodes[this.proxyOf.nodes.length - 1];
+		}
+		append(...children) {
+			for (let child of children) {
+				let nodes = this.normalize(child, this.last);
+				for (let node of nodes) this.proxyOf.nodes.push(node);
+			}
+			this.markDirty();
+			return this;
+		}
+		cleanRaws(keepBetween) {
+			let stack = [this];
+			while (stack.length > 0) {
+				let node = stack.pop();
+				if (node !== this && node.cleanRaws !== Container.prototype.cleanRaws) {
+					node.cleanRaws(keepBetween);
+					continue;
+				}
+				Node.prototype.cleanRaws.call(node, keepBetween);
+				if (node.nodes) for (let child of node.nodes) stack.push(child);
+			}
+		}
+		each(callback) {
+			if (!this.proxyOf.nodes) return void 0;
+			let iterator = this.getIterator();
+			let index, result;
+			while (this.indexes[iterator] < this.proxyOf.nodes.length) {
+				index = this.indexes[iterator];
+				result = callback(this.proxyOf.nodes[index], index);
+				if (result === false) break;
+				this.indexes[iterator] += 1;
+			}
+			delete this.indexes[iterator];
+			return result;
+		}
+		every(condition) {
+			return this.nodes.every(condition);
+		}
+		getIterator() {
+			if (!this.lastEach) this.lastEach = 0;
+			if (!this.indexes) this.indexes = {};
+			this.lastEach += 1;
+			let iterator = this.lastEach;
+			this.indexes[iterator] = 0;
+			return iterator;
+		}
+		getProxyProcessor() {
+			return {
+				get(node, prop) {
+					if (prop === "proxyOf") return node;
+					else if (!node[prop]) return node[prop];
+					else if (prop === "each" || typeof prop === "string" && prop.startsWith("walk")) return (...args) => {
+						return node[prop](...args.map((i) => {
+							if (typeof i === "function") return (child, index) => i(child.toProxy(), index);
+							else return i;
+						}));
+					};
+					else if (prop === "every" || prop === "some") return (cb) => {
+						return node[prop]((child, ...other) => cb(child.toProxy(), ...other));
+					};
+					else if (prop === "root") return () => node.root().toProxy();
+					else if (prop === "nodes") return node.nodes.map((i) => i.toProxy());
+					else if (prop === "first" || prop === "last") return node[prop].toProxy();
+					else return node[prop];
+				},
+				set(node, prop, value) {
+					if (node[prop] === value) return true;
+					node[prop] = value;
+					if (prop === "name" || prop === "params" || prop === "selector") node.markDirty();
+					return true;
+				}
+			};
+		}
+		index(child) {
+			if (typeof child === "number") return child;
+			if (child.proxyOf) child = child.proxyOf;
+			return this.proxyOf.nodes.indexOf(child);
+		}
+		insertAfter(exist, add) {
+			let existIndex = this.index(exist);
+			let nodes = this.normalize(add, this.proxyOf.nodes[existIndex]).reverse();
+			existIndex = this.index(exist);
+			for (let node of nodes) this.proxyOf.nodes.splice(existIndex + 1, 0, node);
+			let index;
+			for (let id in this.indexes) {
+				index = this.indexes[id];
+				if (existIndex < index) this.indexes[id] = index + nodes.length;
+			}
+			this.markDirty();
+			return this;
+		}
+		insertBefore(exist, add) {
+			let existIndex = this.index(exist);
+			let type = existIndex === 0 ? "prepend" : false;
+			let nodes = this.normalize(add, this.proxyOf.nodes[existIndex], type).reverse();
+			existIndex = this.index(exist);
+			for (let node of nodes) this.proxyOf.nodes.splice(existIndex, 0, node);
+			let index;
+			for (let id in this.indexes) {
+				index = this.indexes[id];
+				if (existIndex <= index) this.indexes[id] = index + nodes.length;
+			}
+			this.markDirty();
+			return this;
+		}
+		normalize(nodes, sample) {
+			if (typeof nodes === "string") nodes = cleanSource(parse(nodes).nodes);
+			else if (typeof nodes === "undefined") nodes = [];
+			else if (Array.isArray(nodes)) {
+				nodes = nodes.slice(0);
+				for (let i of nodes) if (i.parent) i.parent.removeChild(i, "ignore");
+			} else if (nodes.type === "root" && this.type !== "document") {
+				nodes = nodes.nodes.slice(0);
+				for (let i of nodes) if (i.parent) i.parent.removeChild(i, "ignore");
+			} else if (nodes.type) nodes = [nodes];
+			else if (nodes.prop) {
+				if (typeof nodes.value === "undefined") throw new Error("Value field is missed in node creation");
+				else if (typeof nodes.value !== "string") nodes.value = String(nodes.value);
+				nodes = [new Declaration(nodes)];
+			} else if (nodes.selector || nodes.selectors) nodes = [new Rule(nodes)];
+			else if (nodes.name) nodes = [new AtRule(nodes)];
+			else if (nodes.text) nodes = [new Comment(nodes)];
+			else throw new Error("Unknown node type in node creation");
+			return nodes.map((i) => {
+				/* c8 ignore next */
+				if (!i[my]) Container.rebuild(i);
+				i = i.proxyOf;
+				if (i.parent) i.parent.removeChild(i);
+				if (i[isClean]) markTreeDirty(i);
+				if (!i.raws) i.raws = {};
+				if (typeof i.raws.before === "undefined") {
+					if (sample && typeof sample.raws.before !== "undefined") i.raws.before = sample.raws.before.replace(/\S/g, "");
+				}
+				i.parent = this.proxyOf;
+				return i;
+			});
+		}
+		prepend(...children) {
+			children = children.reverse();
+			for (let child of children) {
+				let nodes = this.normalize(child, this.first, "prepend").reverse();
+				for (let node of nodes) this.proxyOf.nodes.unshift(node);
+				for (let id in this.indexes) this.indexes[id] = this.indexes[id] + nodes.length;
+			}
+			this.markDirty();
+			return this;
+		}
+		push(child) {
+			child.parent = this;
+			this.proxyOf.nodes.push(child);
+			return this;
+		}
+		removeAll() {
+			for (let node of this.proxyOf.nodes) node.parent = void 0;
+			this.proxyOf.nodes = [];
+			this.markDirty();
+			return this;
+		}
+		removeChild(child) {
+			child = this.index(child);
+			this.proxyOf.nodes[child].parent = void 0;
+			this.proxyOf.nodes.splice(child, 1);
+			let index;
+			for (let id in this.indexes) {
+				index = this.indexes[id];
+				if (index >= child) this.indexes[id] = index - 1;
+			}
+			this.markDirty();
+			return this;
+		}
+		replaceValues(pattern, opts, callback) {
+			if (!callback) {
+				callback = opts;
+				opts = {};
+			}
+			this.walkDecls((decl) => {
+				if (opts.props && !opts.props.includes(decl.prop)) return;
+				if (opts.fast && !decl.value.includes(opts.fast)) return;
+				decl.value = decl.value.replace(pattern, callback);
+			});
+			this.markDirty();
+			return this;
+		}
+		some(condition) {
+			return this.nodes.some(condition);
+		}
+		walk(callback) {
+			if (!this.proxyOf.nodes) return void 0;
+			let stack = [{
+				iterator: this.getIterator(),
+				node: this.proxyOf
+			}];
+			while (stack.length > 0) {
+				let { iterator, node } = stack[stack.length - 1];
+				let index = node.indexes[iterator];
+				if (index >= node.proxyOf.nodes.length) {
+					delete node.indexes[iterator];
+					stack.pop();
+					let parent = stack[stack.length - 1];
+					if (parent) parent.node.indexes[parent.iterator] += 1;
+					continue;
+				}
+				let child = node.proxyOf.nodes[index];
+				let result;
+				try {
+					result = callback(child, index);
+				} catch (e) {
+					throw child.addToError(e);
+				}
+				if (result === false) {
+					for (let opened of stack) delete opened.node.indexes[opened.iterator];
+					return false;
+				}
+				if (child.walk && child.proxyOf.nodes) stack.push({
+					iterator: child.getIterator(),
+					node: child
+				});
+				else node.indexes[iterator] += 1;
+			}
+		}
+		walkAtRules(name, callback) {
+			if (!callback) {
+				callback = name;
+				return this.walk((child, i) => {
+					if (child.type === "atrule") return callback(child, i);
+				});
+			}
+			if (name instanceof RegExp) return this.walk((child, i) => {
+				if (child.type === "atrule" && name.test(child.name)) return callback(child, i);
+			});
+			return this.walk((child, i) => {
+				if (child.type === "atrule" && child.name === name) return callback(child, i);
+			});
+		}
+		walkComments(callback) {
+			return this.walk((child, i) => {
+				if (child.type === "comment") return callback(child, i);
+			});
+		}
+		walkDecls(prop, callback) {
+			if (!callback) {
+				callback = prop;
+				return this.walk((child, i) => {
+					if (child.type === "decl") return callback(child, i);
+				});
+			}
+			if (prop instanceof RegExp) return this.walk((child, i) => {
+				if (child.type === "decl" && prop.test(child.prop)) return callback(child, i);
+			});
+			return this.walk((child, i) => {
+				if (child.type === "decl" && child.prop === prop) return callback(child, i);
+			});
+		}
+		walkRules(selector, callback) {
+			if (!callback) {
+				callback = selector;
+				return this.walk((child, i) => {
+					if (child.type === "rule") return callback(child, i);
+				});
+			}
+			if (selector instanceof RegExp) return this.walk((child, i) => {
+				if (child.type === "rule" && selector.test(child.selector)) return callback(child, i);
+			});
+			return this.walk((child, i) => {
+				if (child.type === "rule" && child.selector === selector) return callback(child, i);
+			});
+		}
+	};
+	Container.registerParse = (dependant) => {
+		parse = dependant;
+	};
+	Container.registerRule = (dependant) => {
+		Rule = dependant;
+	};
+	Container.registerAtRule = (dependant) => {
+		AtRule = dependant;
+	};
+	Container.registerRoot = (dependant) => {
+		Root = dependant;
+	};
+	module.exports = Container;
+	Container.default = Container;
+	/* c8 ignore start */
+	Container.rebuild = (node) => {
+		let stack = [node];
+		while (stack.length > 0) {
+			let next = stack.pop();
+			if (next.type === "atrule") Object.setPrototypeOf(next, AtRule.prototype);
+			else if (next.type === "rule") Object.setPrototypeOf(next, Rule.prototype);
+			else if (next.type === "decl") Object.setPrototypeOf(next, Declaration.prototype);
+			else if (next.type === "comment") Object.setPrototypeOf(next, Comment.prototype);
+			else if (next.type === "root") Object.setPrototypeOf(next, Root.prototype);
+			next[my] = true;
+			if (next.nodes) for (let child of next.nodes) stack.push(child);
+		}
+	};
+}));
+/* c8 ignore stop */
+//#endregion
+//#region ../../node_modules/postcss/lib/at-rule.js
+var require_at_rule = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container();
+	var AtRule = class extends Container {
+		constructor(defaults) {
+			super(defaults);
+			this.type = "atrule";
+		}
+		append(...children) {
+			if (!this.proxyOf.nodes) this.nodes = [];
+			return super.append(...children);
+		}
+		prepend(...children) {
+			if (!this.proxyOf.nodes) this.nodes = [];
+			return super.prepend(...children);
+		}
+	};
+	module.exports = AtRule;
+	AtRule.default = AtRule;
+	Container.registerAtRule(AtRule);
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/document.js
+var require_document = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container();
+	let LazyResult;
+	let Processor;
+	var Document = class extends Container {
+		constructor(defaults) {
+			super({
+				type: "document",
+				...defaults
+			});
+			if (!this.nodes) this.nodes = [];
+		}
+		toResult(opts = {}) {
+			return new LazyResult(new Processor(), this, opts).stringify();
+		}
+	};
+	Document.registerLazyResult = (dependant) => {
+		LazyResult = dependant;
+	};
+	Document.registerProcessor = (dependant) => {
+		Processor = dependant;
+	};
+	module.exports = Document;
+	Document.default = Document;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/previous-map.js
+var require_previous_map = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { existsSync, readFileSync, realpathSync } = __require("fs");
+	let { dirname: dirname$2, isAbsolute: isAbsolute$1, join: join$1, relative: relative$2, sep: sep$2 } = __require("path");
+	let { SourceMapConsumer, SourceMapGenerator } = require_source_map();
+	function realPath(path) {
+		try {
+			return realpathSync(path);
+		} catch {
+			return path;
+		}
+	}
+	function fromBase64(str) {
+		if (Buffer) return Buffer.from(str, "base64").toString();
+		else
+ /* c8 ignore next 2 */
+		return window.atob(str);
+	}
+	var PreviousMap = class {
+		constructor(css, opts) {
+			if (opts.map === false) return;
+			if (opts.unsafeMap) this.unsafeMap = true;
+			this.loadAnnotation(css);
+			this.inline = this.startWith(this.annotation, "data:");
+			let prev = opts.map ? opts.map.prev : void 0;
+			let text = this.loadMap(opts.from, prev);
+			if (!this.mapFile && opts.from) this.mapFile = opts.from;
+			if (this.mapFile) this.root = dirname$2(this.mapFile);
+			if (text) this.text = text;
+		}
+		consumer() {
+			if (!this.consumerCache) this.consumerCache = new SourceMapConsumer(this.json || this.text);
+			return this.consumerCache;
+		}
+		decodeInline(text) {
+			let baseCharsetUri = /^data:application\/json;charset=utf-?8;base64,/;
+			let baseUri = /^data:application\/json;base64,/;
+			let uriMatch = text.match(/^data:application\/json;charset=utf-?8,/) || text.match(/^data:application\/json,/);
+			if (uriMatch) return decodeURIComponent(text.substr(uriMatch[0].length));
+			let baseUriMatch = text.match(baseCharsetUri) || text.match(baseUri);
+			if (baseUriMatch) return fromBase64(text.substr(baseUriMatch[0].length));
+			let encoding = text.slice(22);
+			encoding = encoding.slice(0, encoding.indexOf(","));
+			throw new Error("Unsupported source map encoding " + encoding);
+		}
+		getAnnotationURL(sourceMapString) {
+			return sourceMapString.replace(/^\/\*\s*# sourceMappingURL=/, "").trim();
+		}
+		isMap(map) {
+			if (typeof map !== "object") return false;
+			return typeof map.mappings === "string" || typeof map._mappings === "string" || Array.isArray(map.sections);
+		}
+		loadAnnotation(css) {
+			let comments = css.match(/\/\*\s*# sourceMappingURL=/g);
+			if (!comments) return;
+			let start = css.lastIndexOf(comments.pop());
+			let end = css.indexOf("*/", start);
+			if (start > -1 && end > -1) this.annotation = this.getAnnotationURL(css.substring(start, end));
+		}
+		loadFile(path, cssFile, trusted) {
+			if (!trusted && !this.unsafeMap) {
+				if (!/\.map$/i.test(path)) return void 0;
+				if (!cssFile) return void 0;
+				let rel = relative$2(realPath(dirname$2(cssFile)), realPath(path));
+				if (rel === ".." || rel.startsWith(".." + sep$2) || isAbsolute$1(rel)) return;
+			}
+			this.root = dirname$2(path);
+			if (existsSync(path)) {
+				this.mapFile = path;
+				return readFileSync(path, "utf-8").toString().trim();
+			}
+		}
+		loadMap(file, prev) {
+			if (prev === false) return false;
+			if (prev) {
+				if (typeof prev === "string") return prev;
+				else if (typeof prev === "function") {
+					let prevPath = prev(file);
+					if (prevPath) {
+						let map = this.loadFile(prevPath, file, true);
+						if (!map) throw new Error("Unable to load previous source map: " + prevPath.toString());
+						return map;
+					}
+				} else if (prev instanceof SourceMapConsumer) return SourceMapGenerator.fromSourceMap(prev).toString();
+				else if (prev instanceof SourceMapGenerator) return prev.toString();
+				else if (this.isMap(prev)) return JSON.stringify(prev);
+				else throw new Error("Unsupported previous source map format: " + prev.toString());
+			} else if (this.inline) return this.decodeInline(this.annotation);
+			else if (this.annotation) {
+				let map = this.annotation;
+				if (file) map = join$1(dirname$2(file), map);
+				let unknown = this.loadFile(map, file, false);
+				if (unknown) try {
+					/* c8 ignore next 4 */
+					this.json = JSON.parse(unknown.replace(/^\)]}'[^\n]*\n/, ""));
+				} catch {
+					return;
+				}
+				return unknown;
+			}
+		}
+		startWith(string, start) {
+			if (!string) return false;
+			return string.substr(0, start.length) === start;
+		}
+		withContent() {
+			return !!(this.consumer().sourcesContent && this.consumer().sourcesContent.length > 0);
+		}
+	};
+	module.exports = PreviousMap;
+	PreviousMap.default = PreviousMap;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/input.js
+var require_input = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { nanoid } = require_non_secure();
+	let { isAbsolute, resolve: resolve$2 } = __require("path");
+	let { SourceMapConsumer, SourceMapGenerator } = require_source_map();
+	let { fileURLToPath, pathToFileURL: pathToFileURL$1 } = __require("url");
+	let CssSyntaxError = require_css_syntax_error();
+	let PreviousMap = require_previous_map();
+	let terminalHighlight = require_terminal_highlight();
+	let lineToIndexCache = Symbol("lineToIndexCache");
+	let sourceMapAvailable = Boolean(SourceMapConsumer && SourceMapGenerator);
+	let pathAvailable = Boolean(resolve$2 && isAbsolute);
+	function getLineToIndex(input) {
+		if (input[lineToIndexCache]) return input[lineToIndexCache];
+		let lines = input.css.split("\n");
+		let lineToIndex = new Array(lines.length);
+		let prevIndex = 0;
+		for (let i = 0, l = lines.length; i < l; i++) {
+			lineToIndex[i] = prevIndex;
+			prevIndex += lines[i].length + 1;
+		}
+		input[lineToIndexCache] = lineToIndex;
+		return lineToIndex;
+	}
+	var Input = class {
+		get from() {
+			return this.file || this.id;
+		}
+		constructor(css, opts = {}) {
+			if (css === null || typeof css === "undefined" || typeof css === "object" && !css.toString) throw new Error(`PostCSS received ${css} instead of CSS string`);
+			this.css = css.toString();
+			if (this.css[0] === "﻿" || this.css[0] === "￾") {
+				this.hasBOM = true;
+				this.css = this.css.slice(1);
+			} else this.hasBOM = false;
+			this.document = this.css;
+			if (opts.document) this.document = opts.document.toString();
+			if (opts.from) {
+				if (!pathAvailable || /^\w+:\/\//.test(opts.from) || isAbsolute(opts.from)) this.file = opts.from;
+				else this.file = resolve$2(opts.from);
+			}
+			if (pathAvailable && sourceMapAvailable) {
+				let map = new PreviousMap(this.css, opts);
+				if (map.text) {
+					this.map = map;
+					let file = map.consumer().file;
+					if (!this.file && file) this.file = this.mapResolve(file);
+				}
+			}
+			if (!this.file) this.id = "<input css " + nanoid(6) + ">";
+			if (this.map) this.map.file = this.from;
+		}
+		error(message, line, column, opts = {}) {
+			let endColumn, endLine, endOffset, offset, result;
+			if (line && typeof line === "object") {
+				let start = line;
+				let end = column;
+				if (typeof start.offset === "number") {
+					offset = start.offset;
+					let pos = this.fromOffset(offset);
+					line = pos.line;
+					column = pos.col;
+				} else {
+					line = start.line;
+					column = start.column;
+					offset = this.fromLineAndColumn(line, column);
+				}
+				if (typeof end.offset === "number") {
+					endOffset = end.offset;
+					let pos = this.fromOffset(endOffset);
+					endLine = pos.line;
+					endColumn = pos.col;
+				} else {
+					endLine = end.line;
+					endColumn = end.column;
+					endOffset = this.fromLineAndColumn(end.line, end.column);
+				}
+			} else if (!column) {
+				offset = line;
+				let pos = this.fromOffset(offset);
+				line = pos.line;
+				column = pos.col;
+			} else offset = this.fromLineAndColumn(line, column);
+			let origin = this.origin(line, column, endLine, endColumn);
+			if (origin) result = new CssSyntaxError(message, origin.endLine === void 0 ? origin.line : {
+				column: origin.column,
+				line: origin.line
+			}, origin.endLine === void 0 ? origin.column : {
+				column: origin.endColumn,
+				line: origin.endLine
+			}, origin.source, origin.file, opts.plugin);
+			else result = new CssSyntaxError(message, endLine === void 0 ? line : {
+				column,
+				line
+			}, endLine === void 0 ? column : {
+				column: endColumn,
+				line: endLine
+			}, this.css, this.file, opts.plugin);
+			result.input = {
+				column,
+				endColumn,
+				endLine,
+				endOffset,
+				line,
+				offset,
+				source: this.css
+			};
+			if (this.file) {
+				if (pathToFileURL$1) result.input.url = pathToFileURL$1(this.file).toString();
+				result.input.file = this.file;
+			}
+			return result;
+		}
+		fromLineAndColumn(line, column) {
+			return getLineToIndex(this)[line - 1] + column - 1;
+		}
+		fromOffset(offset) {
+			let lineToIndex = getLineToIndex(this);
+			let lastLine = lineToIndex[lineToIndex.length - 1];
+			let min = 0;
+			if (offset >= lastLine) min = lineToIndex.length - 1;
+			else {
+				let max = lineToIndex.length - 2;
+				let mid;
+				while (min < max) {
+					mid = min + (max - min >> 1);
+					if (offset < lineToIndex[mid]) max = mid - 1;
+					else if (offset >= lineToIndex[mid + 1]) min = mid + 1;
+					else {
+						min = mid;
+						break;
+					}
+				}
+			}
+			return {
+				col: offset - lineToIndex[min] + 1,
+				line: min + 1
+			};
+		}
+		mapResolve(file) {
+			if (/^\w+:\/\//.test(file)) return file;
+			return resolve$2(this.map.consumer().sourceRoot || this.map.root || ".", file);
+		}
+		origin(line, column, endLine, endColumn) {
+			if (!this.map) return false;
+			let consumer = this.map.consumer();
+			let from = consumer.originalPositionFor({
+				column: column - 1,
+				line
+			});
+			if (!from.source) return false;
+			let to;
+			if (typeof endLine === "number") {
+				let toPosition = consumer.originalPositionFor({
+					column: endColumn - 1,
+					line: endLine
+				});
+				if (toPosition.source) to = toPosition;
+			}
+			let fromUrl;
+			if (isAbsolute(from.source)) fromUrl = pathToFileURL$1(from.source);
+			else fromUrl = new URL(from.source, this.map.consumer().sourceRoot || pathToFileURL$1(this.map.mapFile));
+			let result = {
+				column: from.column + 1,
+				endColumn: to && to.column + 1,
+				endLine: to && to.line,
+				line: from.line,
+				url: fromUrl.toString()
+			};
+			if (fromUrl.protocol === "file:") {
+				if (fileURLToPath) result.file = fileURLToPath(fromUrl);
+				else
+ /* c8 ignore next 2 */
+				throw new Error(`file: protocol is not available in this PostCSS build`);
+			}
+			let source = consumer.sourceContentFor(from.source);
+			if (source) result.source = source;
+			return result;
+		}
+		toJSON() {
+			let json = {};
+			for (let name of [
+				"hasBOM",
+				"css",
+				"file",
+				"id"
+			]) if (this[name] != null) json[name] = this[name];
+			if (this.map) {
+				json.map = { ...this.map };
+				if (json.map.consumerCache) json.map.consumerCache = void 0;
+			}
+			return json;
+		}
+	};
+	module.exports = Input;
+	Input.default = Input;
+	if (terminalHighlight && terminalHighlight.registerInput) terminalHighlight.registerInput(Input);
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/root.js
+var require_root = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container();
+	let LazyResult;
+	let Processor;
+	var Root = class extends Container {
+		constructor(defaults) {
+			super(defaults);
+			this.type = "root";
+			if (!this.nodes) this.nodes = [];
+		}
+		normalize(child, sample, type) {
+			let keepBefore = /* @__PURE__ */ new Set();
+			for (let node of Array.isArray(child) ? child : [child]) if (node && typeof node === "object" && !node.parent && node.raws && typeof node.raws.before !== "undefined") keepBefore.add(node.raws);
+			let nodes = super.normalize(child);
+			if (sample) {
+				if (type === "prepend") {
+					if (this.nodes.length > 1) sample.raws.before = this.nodes[1].raws.before;
+					else delete sample.raws.before;
+				} else if (this.first !== sample) {
+					for (let node of nodes) if (!keepBefore.has(node.raws)) node.raws.before = sample.raws.before;
+				}
+			}
+			return nodes;
+		}
+		removeChild(child, ignore) {
+			let index = this.index(child);
+			if (!ignore && index === 0 && this.nodes.length > 1) this.nodes[1].raws.before = this.nodes[index].raws.before;
+			return super.removeChild(child);
+		}
+		toResult(opts = {}) {
+			return new LazyResult(new Processor(), this, opts).stringify();
+		}
+	};
+	Root.registerLazyResult = (dependant) => {
+		LazyResult = dependant;
+	};
+	Root.registerProcessor = (dependant) => {
+		Processor = dependant;
+	};
+	module.exports = Root;
+	Root.default = Root;
+	Container.registerRoot(Root);
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/list.js
+var require_list = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let list = {
+		comma(string) {
+			return list.split(string, [","], true);
+		},
+		space(string) {
+			return list.split(string, [
+				" ",
+				"\n",
+				"	"
+			]);
+		},
+		split(string, separators, last) {
+			if (typeof string !== "string") return [];
+			let array = [];
+			let current = "";
+			let split = false;
+			let func = 0;
+			let inQuote = false;
+			let prevQuote = "";
+			let escape = false;
+			let inComment = false;
+			for (let i = 0; i < string.length; i++) {
+				let letter = string[i];
+				if (inComment) {
+					current += letter;
+					if (letter === "*" && string[i + 1] === "/") {
+						current += "/";
+						i += 1;
+						inComment = false;
+					}
+					continue;
+				}
+				if (escape) escape = false;
+				else if (letter === "\\") escape = true;
+				else if (inQuote) {
+					if (letter === prevQuote) inQuote = false;
+				} else if (letter === "\"" || letter === "'") {
+					inQuote = true;
+					prevQuote = letter;
+				} else if (letter === "/" && string[i + 1] === "*") {
+					current += "/*";
+					i += 1;
+					inComment = true;
+					continue;
+				} else if (letter === "(") func += 1;
+				else if (letter === ")") {
+					if (func > 0) func -= 1;
+				} else if (func === 0) {
+					if (separators.includes(letter)) split = true;
+				}
+				if (split) {
+					let value = current.trim();
+					if (last || value !== "") array.push(value);
+					current = "";
+					split = false;
+				} else current += letter;
+			}
+			let value = current.trim();
+			if (last || value !== "") array.push(value);
+			return array;
+		}
+	};
+	module.exports = list;
+	list.default = list;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/rule.js
+var require_rule = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let Container = require_container();
+	let list = require_list();
+	var Rule = class extends Container {
+		get selectors() {
+			return list.comma(this.selector);
+		}
+		set selectors(values) {
+			let match = this.selector ? this.selector.match(/,\s*/) : null;
+			let sep = match ? match[0] : "," + this.raw("between", "beforeOpen");
+			this.selector = values.join(sep);
+		}
+		constructor(defaults) {
+			super(defaults);
+			this.type = "rule";
+			if (!this.nodes) this.nodes = [];
+		}
+	};
+	module.exports = Rule;
+	Rule.default = Rule;
+	Container.registerRule(Rule);
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/fromJSON.js
+var require_fromJSON = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let AtRule = require_at_rule();
+	let Comment = require_comment();
+	let Declaration = require_declaration();
+	let Input = require_input();
+	let PreviousMap = require_previous_map();
+	let Root = require_root();
+	let Rule = require_rule();
+	function hydrateInputs(json, inputs) {
+		if (!json.inputs) return inputs;
+		return json.inputs.map((input) => {
+			let inputHydrated = {
+				...input,
+				__proto__: Input.prototype
+			};
+			if (inputHydrated.map) inputHydrated.map = {
+				...inputHydrated.map,
+				__proto__: PreviousMap.prototype
+			};
+			return inputHydrated;
+		});
+	}
+	function constructNode(json, inputs, children) {
+		let defaults = { ...json };
+		delete defaults.inputs;
+		delete defaults.nodes;
+		if (defaults.source) {
+			let { inputId, ...source } = defaults.source;
+			defaults.source = source;
+			if (inputId != null) defaults.source.input = inputs[inputId];
+		}
+		let node;
+		if (defaults.type === "root") node = new Root(defaults);
+		else if (defaults.type === "decl") node = new Declaration(defaults);
+		else if (defaults.type === "rule") node = new Rule(defaults);
+		else if (defaults.type === "comment") node = new Comment(defaults);
+		else if (defaults.type === "atrule") node = new AtRule(defaults);
+		else throw new Error("Unknown node type: " + json.type);
+		if (children) {
+			node.nodes = children;
+			for (let child of children) child.parent = node;
+		}
+		return node;
+	}
+	function fromJSON(json, inputs) {
+		if (Array.isArray(json)) return json.map((n) => fromJSON(n));
+		let result;
+		let stack = [{
+			childIndex: 0,
+			children: [],
+			inputs: hydrateInputs(json, inputs),
+			json
+		}];
+		while (stack.length > 0) {
+			let frame = stack[stack.length - 1];
+			let jsonNodes = frame.json.nodes;
+			if (jsonNodes && frame.childIndex < jsonNodes.length) {
+				let childJson = jsonNodes[frame.childIndex];
+				frame.childIndex += 1;
+				stack.push({
+					childIndex: 0,
+					children: [],
+					inputs: hydrateInputs(childJson, frame.inputs),
+					json: childJson
+				});
+				continue;
+			}
+			stack.pop();
+			let node = constructNode(frame.json, frame.inputs, jsonNodes ? frame.children : void 0);
+			if (stack.length > 0) stack[stack.length - 1].children.push(node);
+			else result = node;
+		}
+		return result;
+	}
+	module.exports = fromJSON;
+	fromJSON.default = fromJSON;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/map-generator.js
+var require_map_generator = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { dirname: dirname$1, relative: relative$1, resolve: resolve$1, sep: sep$1 } = __require("path");
+	let { SourceMapConsumer, SourceMapGenerator } = require_source_map();
+	let { pathToFileURL } = __require("url");
+	let Input = require_input();
+	let sourceMapAvailable = Boolean(SourceMapConsumer && SourceMapGenerator);
+	let pathAvailable = Boolean(dirname$1 && resolve$1 && relative$1 && sep$1);
+	var MapGenerator = class {
+		constructor(stringify, root, opts, cssString) {
+			this.stringify = stringify;
+			this.mapOpts = opts.map || {};
+			this.root = root;
+			this.opts = opts;
+			this.css = cssString;
+			this.originalCSS = cssString;
+			this.usesFileUrls = !this.mapOpts.from && this.mapOpts.absolute;
+			this.memoizedFileURLs = /* @__PURE__ */ new Map();
+			this.memoizedPaths = /* @__PURE__ */ new Map();
+			this.memoizedURLs = /* @__PURE__ */ new Map();
+		}
+		addAnnotation() {
+			let content;
+			if (this.isInline()) content = "data:application/json;base64," + this.toBase64(this.map.toString());
+			else if (typeof this.mapOpts.annotation === "string") content = this.mapOpts.annotation;
+			else if (typeof this.mapOpts.annotation === "function") content = this.mapOpts.annotation(this.opts.to, this.root);
+			else content = this.outputFile() + ".map";
+			let eol = "\n";
+			if (this.css.includes("\r\n")) eol = "\r\n";
+			this.css += eol + "/*# sourceMappingURL=" + content + " */";
+		}
+		applyPrevMaps() {
+			for (let prev of this.previous()) {
+				let from = this.toUrl(this.path(prev.file));
+				let root = prev.root || dirname$1(prev.file);
+				let map;
+				if (this.mapOpts.sourcesContent === false) {
+					map = new SourceMapConsumer(prev.text);
+					if (map.sourcesContent) map.sourcesContent = null;
+				} else map = prev.consumer();
+				this.map.applySourceMap(map, from, this.toUrl(this.path(root)));
+			}
+		}
+		clearAnnotation() {
+			if (this.mapOpts.annotation === false) return;
+			if (this.root) {
+				let node;
+				for (let i = this.root.nodes.length - 1; i >= 0; i--) {
+					node = this.root.nodes[i];
+					if (node.type !== "comment") continue;
+					if (node.text.startsWith("# sourceMappingURL=")) this.root.removeChild(i);
+				}
+			} else if (this.css) {
+				let annotation = "/*# sourceMappingURL=";
+				let css = "";
+				let cursor = 0;
+				let startIndex;
+				while ((startIndex = this.css.indexOf(annotation, cursor)) !== -1) {
+					let endIndex = this.css.indexOf("*/", startIndex + 21);
+					if (endIndex === -1) break;
+					while (startIndex > cursor && this.css[startIndex - 1] === "\n") startIndex--;
+					css += this.css.slice(cursor, startIndex);
+					cursor = endIndex + 2;
+				}
+				if (cursor > 0) this.css = css + this.css.slice(cursor);
+			}
+		}
+		generate() {
+			this.clearAnnotation();
+			if (pathAvailable && sourceMapAvailable && this.isMap()) return this.generateMap();
+			else {
+				let result = "";
+				this.stringify(this.root, (i) => {
+					result += i;
+				});
+				return [result];
+			}
+		}
+		generateMap() {
+			if (this.root) this.generateString();
+			else if (this.previous().length === 1) {
+				let prev = this.previous()[0].consumer();
+				prev.file = this.outputFile();
+				this.map = SourceMapGenerator.fromSourceMap(prev, { ignoreInvalidMapping: true });
+			} else {
+				this.map = new SourceMapGenerator({
+					file: this.outputFile(),
+					ignoreInvalidMapping: true
+				});
+				this.map.addMapping({
+					generated: {
+						column: 0,
+						line: 1
+					},
+					original: {
+						column: 0,
+						line: 1
+					},
+					source: this.opts.from ? this.toUrl(this.path(this.opts.from)) : "<no source>"
+				});
+			}
+			if (this.isSourcesContent()) this.setSourcesContent();
+			if (this.root && this.previous().length > 0) this.applyPrevMaps();
+			if (this.isAnnotation()) this.addAnnotation();
+			if (this.isInline()) return [this.css];
+			else return [this.css, this.map];
+		}
+		generateString() {
+			this.css = "";
+			this.map = new SourceMapGenerator({
+				file: this.outputFile(),
+				ignoreInvalidMapping: true
+			});
+			let line = 1;
+			let column = 1;
+			let noSource = "<no source>";
+			let mapping = {
+				generated: {
+					column: 0,
+					line: 0
+				},
+				original: {
+					column: 0,
+					line: 0
+				},
+				source: ""
+			};
+			let last, lines;
+			this.stringify(this.root, (str, node, type) => {
+				this.css += str;
+				if (node && type !== "end") {
+					mapping.generated.line = line;
+					mapping.generated.column = column - 1;
+					if (node.source && node.source.start) {
+						mapping.source = this.sourcePath(node);
+						mapping.original.line = node.source.start.line;
+						mapping.original.column = node.source.start.column - 1;
+						this.map.addMapping(mapping);
+					} else {
+						mapping.source = noSource;
+						mapping.original.line = 1;
+						mapping.original.column = 0;
+						this.map.addMapping(mapping);
+					}
+				}
+				lines = str.match(/\n/g);
+				if (lines) {
+					line += lines.length;
+					last = str.lastIndexOf("\n");
+					column = str.length - last;
+				} else column += str.length;
+				if (node && type !== "start") {
+					let p = node.parent || { raws: {} };
+					if (!(node.type === "decl" || node.type === "atrule" && !node.nodes) || node !== p.last || p.raws.semicolon) {
+						if (node.source && node.source.end) {
+							mapping.source = this.sourcePath(node);
+							mapping.original.line = node.source.end.line;
+							mapping.original.column = node.source.end.column - 1;
+							mapping.generated.line = line;
+							mapping.generated.column = column - 2;
+							this.map.addMapping(mapping);
+						} else {
+							mapping.source = noSource;
+							mapping.original.line = 1;
+							mapping.original.column = 0;
+							mapping.generated.line = line;
+							mapping.generated.column = column - 1;
+							this.map.addMapping(mapping);
+						}
+					}
+				}
+			});
+		}
+		isAnnotation() {
+			if (this.isInline()) return true;
+			if (typeof this.mapOpts.annotation !== "undefined") return this.mapOpts.annotation;
+			if (this.previous().length) return this.previous().some((i) => i.annotation);
+			return true;
+		}
+		isInline() {
+			if (typeof this.mapOpts.inline !== "undefined") return this.mapOpts.inline;
+			let annotation = this.mapOpts.annotation;
+			if (typeof annotation !== "undefined" && annotation !== true) return false;
+			if (this.previous().length) return this.previous().some((i) => i.inline);
+			return true;
+		}
+		isMap() {
+			if (typeof this.opts.map !== "undefined") return !!this.opts.map;
+			return this.previous().length > 0;
+		}
+		isSourcesContent() {
+			if (typeof this.mapOpts.sourcesContent !== "undefined") return this.mapOpts.sourcesContent;
+			if (this.previous().length) return this.previous().some((i) => i.withContent());
+			return true;
+		}
+		outputFile() {
+			if (this.opts.to) return this.path(this.opts.to);
+			else if (this.opts.from) return this.path(this.opts.from);
+			else return "to.css";
+		}
+		path(file) {
+			if (this.mapOpts.absolute) return file;
+			if (file.charCodeAt(0) === 60) return file;
+			if (/^\w+:\/\//.test(file)) return file;
+			let cached = this.memoizedPaths.get(file);
+			if (cached) return cached;
+			let from = this.opts.to ? dirname$1(this.opts.to) : ".";
+			if (typeof this.mapOpts.annotation === "string") from = dirname$1(resolve$1(from, this.mapOpts.annotation));
+			let path = relative$1(from, file);
+			this.memoizedPaths.set(file, path);
+			return path;
+		}
+		previous() {
+			if (!this.previousMaps) {
+				this.previousMaps = [];
+				if (this.root) this.root.walk((node) => {
+					if (node.source && node.source.input.map) {
+						let map = node.source.input.map;
+						if (!this.previousMaps.includes(map)) this.previousMaps.push(map);
+					}
+				});
+				else {
+					let input = new Input(this.originalCSS, this.opts);
+					if (input.map) this.previousMaps.push(input.map);
+				}
+			}
+			return this.previousMaps;
+		}
+		setSourcesContent() {
+			let already = {};
+			if (this.root) this.root.walk((node) => {
+				if (node.source) {
+					let from = node.source.input.from;
+					if (from && !already[from]) {
+						already[from] = true;
+						let fromUrl = this.usesFileUrls ? this.toFileUrl(from) : this.toUrl(this.path(from));
+						this.map.setSourceContent(fromUrl, node.source.input.css);
+					}
+				}
+			});
+			else if (this.css) {
+				let from = this.opts.from ? this.toUrl(this.path(this.opts.from)) : "<no source>";
+				this.map.setSourceContent(from, this.css);
+			}
+		}
+		sourcePath(node) {
+			if (this.mapOpts.from) return this.toUrl(this.mapOpts.from);
+			else if (this.usesFileUrls) return this.toFileUrl(node.source.input.from);
+			else return this.toUrl(this.path(node.source.input.from));
+		}
+		toBase64(str) {
+			if (Buffer) return Buffer.from(str).toString("base64");
+			else return window.btoa(unescape(encodeURIComponent(str)));
+		}
+		toFileUrl(path) {
+			let cached = this.memoizedFileURLs.get(path);
+			if (cached) return cached;
+			if (pathToFileURL) {
+				let fileURL = pathToFileURL(path).toString();
+				this.memoizedFileURLs.set(path, fileURL);
+				return fileURL;
+			} else throw new Error("`map.absolute` option is not available in this PostCSS build");
+		}
+		toUrl(path) {
+			let cached = this.memoizedURLs.get(path);
+			if (cached) return cached;
+			if (sep$1 === "\\") path = path.replace(/\\/g, "/");
+			let url = encodeURI(path).replace(/[#?]/g, encodeURIComponent);
+			this.memoizedURLs.set(path, url);
+			return url;
+		}
+	};
+	module.exports = MapGenerator;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/parser.js
+var require_parser = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let AtRule = require_at_rule();
+	let Comment = require_comment();
+	let Declaration = require_declaration();
+	let Root = require_root();
+	let Rule = require_rule();
+	let tokenizer = require_tokenize();
+	const SAFE_COMMENT_NEIGHBOR = {
+		empty: true,
+		space: true
+	};
+	function findLastWithPosition(tokens) {
+		for (let i = tokens.length - 1; i >= 0; i--) {
+			let token = tokens[i];
+			let pos = token[3] || token[2];
+			if (pos) return pos;
+		}
+	}
+	function tokensToString(tokens, from, to) {
+		let result = "";
+		for (let i = from; i < to; i++) result += tokens[i][1];
+		return result;
+	}
+	var Parser = class {
+		constructor(input) {
+			this.input = input;
+			this.root = new Root();
+			this.current = this.root;
+			this.spaces = "";
+			this.semicolon = false;
+			this.createTokenizer();
+			this.root.source = {
+				input,
+				start: {
+					column: 1,
+					line: 1,
+					offset: 0
+				}
+			};
+		}
+		atrule(token) {
+			let node = new AtRule();
+			node.name = token[1].slice(1);
+			if (node.name === "") this.unnamedAtrule(node, token);
+			this.init(node, token[2]);
+			let type;
+			let prev;
+			let shift;
+			let last = false;
+			let open = false;
+			let params = [];
+			let brackets = [];
+			while (!this.tokenizer.endOfFile()) {
+				token = this.tokenizer.nextToken();
+				type = token[0];
+				if (type === "(" || type === "[") brackets.push(type === "(" ? ")" : "]");
+				else if (type === "{" && brackets.length > 0) brackets.push("}");
+				else if (type === brackets[brackets.length - 1]) brackets.pop();
+				if (brackets.length === 0) {
+					if (type === ";") {
+						node.source.end = this.getPosition(token[2]);
+						node.source.end.offset++;
+						this.semicolon = true;
+						break;
+					} else if (type === "{") {
+						open = true;
+						break;
+					} else if (type === "}") {
+						if (params.length > 0) {
+							shift = params.length - 1;
+							prev = params[shift];
+							while (prev && prev[0] === "space") prev = params[--shift];
+							if (prev) {
+								node.source.end = this.getPosition(prev[3] || prev[2]);
+								node.source.end.offset++;
+							}
+						}
+						this.end(token);
+						break;
+					} else params.push(token);
+				} else params.push(token);
+				if (this.tokenizer.endOfFile()) {
+					last = true;
+					break;
+				}
+			}
+			node.raws.between = this.spacesAndCommentsFromEnd(params);
+			if (params.length) {
+				node.raws.afterName = this.spacesAndCommentsFromStart(params);
+				this.raw(node, "params", params);
+				if (last) {
+					token = params[params.length - 1];
+					node.source.end = this.getPosition(token[3] || token[2]);
+					node.source.end.offset++;
+					this.spaces = node.raws.between;
+					node.raws.between = "";
+				}
+			} else {
+				node.raws.afterName = "";
+				node.params = "";
+			}
+			if (open) {
+				node.nodes = [];
+				this.current = node;
+			}
+		}
+		checkMissedSemicolon(tokens) {
+			let colon = this.colon(tokens);
+			if (colon === false) return;
+			let founded = 0;
+			let token;
+			for (let j = colon - 1; j >= 0; j--) {
+				token = tokens[j];
+				if (token[0] !== "space") {
+					founded += 1;
+					if (founded === 2) break;
+				}
+			}
+			throw this.input.error("Missed semicolon", token[0] === "word" ? token[3] + 1 : token[2]);
+		}
+		colon(tokens) {
+			let brackets = 0;
+			let prev, token, type;
+			for (let [i, element] of tokens.entries()) {
+				token = element;
+				type = token[0];
+				if (type === "(") brackets += 1;
+				if (type === ")") brackets -= 1;
+				if (brackets === 0 && type === ":") {
+					if (!prev) this.doubleColon(token);
+					else if (prev[0] === "word" && prev[1] === "progid") continue;
+					else return i;
+				}
+				prev = token;
+			}
+			return false;
+		}
+		comment(token) {
+			let node = new Comment();
+			this.init(node, token[2]);
+			node.source.end = this.getPosition(token[3] || token[2]);
+			node.source.end.offset++;
+			let text = token[1].slice(2, -2);
+			if (!text.trim()) {
+				node.text = "";
+				node.raws.left = text;
+				node.raws.right = "";
+			} else {
+				let match = text.match(/^(\s*)([^]*\S)(\s*)$/);
+				node.text = match[2];
+				node.raws.left = match[1];
+				node.raws.right = match[3];
+			}
+		}
+		createTokenizer() {
+			this.tokenizer = tokenizer(this.input);
+		}
+		decl(tokens, customProperty) {
+			let node = new Declaration();
+			this.init(node, tokens[0][2]);
+			let last = tokens[tokens.length - 1];
+			if (last[0] === ";") {
+				this.semicolon = true;
+				tokens.pop();
+			}
+			node.source.end = this.getPosition(last[3] || last[2] || findLastWithPosition(tokens));
+			node.source.end.offset++;
+			let start = 0;
+			while (tokens[start][0] !== "word") {
+				if (start === tokens.length - 1) this.unknownWord([tokens[start]]);
+				start++;
+			}
+			node.raws.before += tokensToString(tokens, 0, start);
+			node.source.start = this.getPosition(tokens[start][2]);
+			let propStart = start;
+			while (start < tokens.length) {
+				let type = tokens[start][0];
+				if (type === ":" || type === "space" || type === "comment") break;
+				start++;
+			}
+			node.prop = tokensToString(tokens, propStart, start);
+			let betweenStart = start;
+			let token;
+			while (start < tokens.length) {
+				token = tokens[start];
+				start++;
+				if (token[0] === ":") break;
+				if (token[0] === "word" && /\w/.test(token[1])) this.unknownWord([token]);
+			}
+			node.raws.between = tokensToString(tokens, betweenStart, start);
+			if (node.prop[0] === "_" || node.prop[0] === "*") {
+				node.raws.before += node.prop[0];
+				node.prop = node.prop.slice(1);
+			}
+			let firstSpacesStart = start;
+			while (start < tokens.length) {
+				let next = tokens[start][0];
+				if (next !== "space" && next !== "comment") break;
+				start++;
+			}
+			let firstSpaces = tokens.slice(firstSpacesStart, start);
+			tokens = tokens.slice(start);
+			this.precheckMissedSemicolon(tokens);
+			for (let i = tokens.length - 1; i >= 0; i--) {
+				token = tokens[i];
+				if (token[1].toLowerCase() === "!important") {
+					node.important = true;
+					let string = this.stringFrom(tokens, i);
+					string = this.spacesFromEnd(tokens) + string;
+					if (string !== " !important") node.raws.important = string;
+					break;
+				} else if (token[1].toLowerCase() === "important") {
+					let cache = tokens.slice(0);
+					let str = "";
+					for (let j = i; j > 0; j--) {
+						let type = cache[j][0];
+						if (str.trim().startsWith("!") && type !== "space") break;
+						str = cache.pop()[1] + str;
+					}
+					if (str.trim().startsWith("!")) {
+						node.important = true;
+						node.raws.important = str;
+						tokens = cache;
+					}
+				}
+				if (token[0] !== "space" && token[0] !== "comment") break;
+			}
+			if (tokens.some((i) => i[0] !== "space" && i[0] !== "comment")) {
+				node.raws.between += firstSpaces.map((i) => i[1]).join("");
+				firstSpaces = [];
+			}
+			this.raw(node, "value", firstSpaces.concat(tokens), customProperty);
+			if (node.value.includes(":") && !customProperty) this.checkMissedSemicolon(tokens);
+		}
+		doubleColon(token) {
+			throw this.input.error("Double colon", { offset: token[2] }, { offset: token[2] + token[1].length });
+		}
+		emptyRule(token) {
+			let node = new Rule();
+			this.init(node, token[2]);
+			node.selector = "";
+			node.raws.between = "";
+			this.current = node;
+		}
+		end(token) {
+			if (this.current.nodes && this.current.nodes.length) this.current.raws.semicolon = this.semicolon;
+			this.semicolon = false;
+			this.current.raws.after = (this.current.raws.after || "") + this.spaces;
+			this.spaces = "";
+			if (this.current.parent) {
+				this.current.source.end = this.getPosition(token[2]);
+				this.current.source.end.offset++;
+				this.current = this.current.parent;
+			} else this.unexpectedClose(token);
+		}
+		endFile() {
+			if (this.current.parent) this.unclosedBlock();
+			if (this.current.nodes && this.current.nodes.length) this.current.raws.semicolon = this.semicolon;
+			this.current.raws.after = (this.current.raws.after || "") + this.spaces;
+			this.root.source.end = this.getPosition(this.tokenizer.position());
+		}
+		freeSemicolon(token) {
+			this.spaces += token[1];
+			if (this.current.nodes) {
+				let prev = this.current.nodes[this.current.nodes.length - 1];
+				if (prev && prev.type === "rule" && !prev.raws.ownSemicolon) {
+					prev.raws.ownSemicolon = this.spaces;
+					this.spaces = "";
+					prev.source.end = this.getPosition(token[2]);
+					prev.source.end.offset++;
+				}
+			}
+		}
+		getPosition(offset) {
+			let pos = this.input.fromOffset(offset);
+			return {
+				column: pos.col,
+				line: pos.line,
+				offset
+			};
+		}
+		init(node, offset) {
+			this.current.push(node);
+			node.source = {
+				input: this.input,
+				start: this.getPosition(offset)
+			};
+			node.raws.before = this.spaces;
+			this.spaces = "";
+			if (node.type !== "comment") this.semicolon = false;
+		}
+		other(start) {
+			let end = false;
+			let type = null;
+			let colon = false;
+			let bracket = null;
+			let brackets = [];
+			let customProperty = start[1].startsWith("--");
+			let tokens = [];
+			let token = start;
+			while (token) {
+				type = token[0];
+				tokens.push(token);
+				if (type === "(" || type === "[") {
+					if (!bracket) bracket = token;
+					brackets.push(type === "(" ? ")" : "]");
+				} else if (customProperty && colon && type === "{") {
+					if (!bracket) bracket = token;
+					brackets.push("}");
+				} else if (brackets.length === 0) {
+					if (type === ";") {
+						if (colon) {
+							this.decl(tokens, customProperty);
+							return;
+						} else break;
+					} else if (type === "{") {
+						this.rule(tokens);
+						return;
+					} else if (type === "}") {
+						this.tokenizer.back(tokens.pop());
+						end = true;
+						break;
+					} else if (type === ":") colon = true;
+				} else if (type === brackets[brackets.length - 1]) {
+					brackets.pop();
+					if (brackets.length === 0) bracket = null;
+				}
+				token = this.tokenizer.nextToken();
+			}
+			if (this.tokenizer.endOfFile()) end = true;
+			if (brackets.length > 0) this.unclosedBracket(bracket);
+			if (end && colon) {
+				if (!customProperty) while (tokens.length) {
+					token = tokens[tokens.length - 1][0];
+					if (token !== "space" && token !== "comment") break;
+					this.tokenizer.back(tokens.pop());
+				}
+				this.decl(tokens, customProperty);
+			} else this.unknownWord(tokens);
+		}
+		parse() {
+			let token;
+			while (!this.tokenizer.endOfFile()) {
+				token = this.tokenizer.nextToken();
+				switch (token[0]) {
+					case "space":
+						this.spaces += token[1];
+						break;
+					case ";":
+						this.freeSemicolon(token);
+						break;
+					case "}":
+						this.end(token);
+						break;
+					case "comment":
+						this.comment(token);
+						break;
+					case "at-word":
+						this.atrule(token);
+						break;
+					case "{":
+						this.emptyRule(token);
+						break;
+					default: this.other(token);
+				}
+			}
+			this.endFile();
+		}
+		precheckMissedSemicolon() {}
+		raw(node, prop, tokens, customProperty) {
+			let token, type;
+			let length = tokens.length;
+			let value = "";
+			let last = "";
+			let clean = true;
+			let next, prev;
+			for (let i = 0; i < length; i += 1) {
+				token = tokens[i];
+				type = token[0];
+				if (type === "space" && i === length - 1 && !customProperty) clean = false;
+				else if (type === "comment") {
+					prev = tokens[i - 1] ? tokens[i - 1][0] : "empty";
+					next = tokens[i + 1] ? tokens[i + 1][0] : "empty";
+					if (!SAFE_COMMENT_NEIGHBOR[prev] && !SAFE_COMMENT_NEIGHBOR[next]) {
+						if (last === ",") clean = false;
+						else {
+							value += token[1];
+							last = token[1].slice(-1);
+						}
+					} else clean = false;
+				} else {
+					value += token[1];
+					last = token[1].slice(-1);
+				}
+			}
+			if (!clean) {
+				let raw = tokens.reduce((all, i) => all + i[1], "");
+				node.raws[prop] = {
+					raw,
+					value
+				};
+			}
+			node[prop] = value;
+		}
+		rule(tokens) {
+			tokens.pop();
+			let node = new Rule();
+			this.init(node, tokens[0][2]);
+			node.raws.between = this.spacesAndCommentsFromEnd(tokens);
+			this.raw(node, "selector", tokens);
+			this.current = node;
+		}
+		spacesAndCommentsFromEnd(tokens) {
+			let lastTokenType;
+			let spaces = "";
+			while (tokens.length) {
+				lastTokenType = tokens[tokens.length - 1][0];
+				if (lastTokenType !== "space" && lastTokenType !== "comment") break;
+				spaces = tokens.pop()[1] + spaces;
+			}
+			return spaces;
+		}
+		spacesAndCommentsFromStart(tokens) {
+			let next;
+			let spaces = "";
+			while (tokens.length) {
+				next = tokens[0][0];
+				if (next !== "space" && next !== "comment") break;
+				spaces += tokens.shift()[1];
+			}
+			return spaces;
+		}
+		spacesFromEnd(tokens) {
+			let lastTokenType;
+			let spaces = "";
+			while (tokens.length) {
+				lastTokenType = tokens[tokens.length - 1][0];
+				if (lastTokenType !== "space") break;
+				spaces = tokens.pop()[1] + spaces;
+			}
+			return spaces;
+		}
+		stringFrom(tokens, from) {
+			let result = "";
+			for (let i = from; i < tokens.length; i++) result += tokens[i][1];
+			tokens.splice(from, tokens.length - from);
+			return result;
+		}
+		unclosedBlock() {
+			let pos = this.current.source.start;
+			throw this.input.error("Unclosed block", pos.line, pos.column);
+		}
+		unclosedBracket(bracket) {
+			throw this.input.error("Unclosed bracket", { offset: bracket[2] }, { offset: bracket[2] + 1 });
+		}
+		unexpectedClose(token) {
+			throw this.input.error("Unexpected }", { offset: token[2] }, { offset: token[2] + 1 });
+		}
+		unknownWord(tokens) {
+			throw this.input.error("Unknown word " + tokens[0][1], { offset: tokens[0][2] }, { offset: tokens[0][2] + tokens[0][1].length });
+		}
+		unnamedAtrule(node, token) {
+			throw this.input.error("At-rule without name", { offset: token[2] }, { offset: token[2] + token[1].length });
+		}
+	};
+	module.exports = Parser;
+}));
+//#endregion
+//#region ../../node_modules/postcss/lib/parse.js
 var require_parse = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let Container = require_container();
 	let Input = require_input();
@@ -17251,7 +21231,7 @@ var require_parse = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	Container.registerParse(parse);
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/warning.js
+//#region ../../node_modules/postcss/lib/warning.js
 var require_warning = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let Container = require_container();
 	let { my } = require_symbols();
@@ -17283,7 +21263,7 @@ var require_warning = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	Warning.default = Warning;
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/result.js
+//#region ../../node_modules/postcss/lib/result.js
 var require_result = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let Warning = require_warning();
 	var Result = class {
@@ -17317,7 +21297,7 @@ var require_result = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	Result.default = Result;
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/warn-once.js
+//#region ../../node_modules/postcss/lib/warn-once.js
 var require_warn_once = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let printed = {};
 	module.exports = function warnOnce(message) {
@@ -17327,7 +21307,7 @@ var require_warn_once = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	};
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/lazy-result.js
+//#region ../../node_modules/postcss/lib/lazy-result.js
 var require_lazy_result = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let Container = require_container();
 	let Document = require_document();
@@ -17798,7 +21778,7 @@ var require_lazy_result = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	Document.registerLazyResult(LazyResult);
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/no-work-result.js
+//#region ../../node_modules/postcss/lib/no-work-result.js
 var require_no_work_result = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let MapGenerator = require_map_generator();
 	let parse = require_parse();
@@ -17897,7 +21877,7 @@ var require_no_work_result = /* @__PURE__ */ __commonJSMin(((exports, module) =>
 	NoWorkResult.default = NoWorkResult;
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/processor.js
+//#region ../../node_modules/postcss/lib/processor.js
 var require_processor = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let Document = require_document();
 	let LazyResult = require_lazy_result();
@@ -17905,7 +21885,7 @@ var require_processor = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let Root = require_root();
 	var Processor = class {
 		constructor(plugins = []) {
-			this.version = "8.5.28";
+			this.version = "8.5.29";
 			this.plugins = this.normalize(plugins);
 		}
 		normalize(plugins) {
@@ -17937,8 +21917,8 @@ var require_processor = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	Document.registerProcessor(Processor);
 }));
 //#endregion
-//#region ../dsgraph-adapters/node_modules/postcss/lib/postcss.mjs
-var import_postcss = /* @__PURE__ */ __toESM((/* @__PURE__ */ __commonJSMin(((exports, module) => {
+//#region ../../node_modules/postcss/lib/postcss.js
+var require_postcss = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	let AtRule = require_at_rule();
 	let Comment = require_comment();
 	let Container = require_container();
@@ -18012,888 +21992,679 @@ var import_postcss = /* @__PURE__ */ __toESM((/* @__PURE__ */ __commonJSMin(((ex
 	LazyResult.registerPostcss(postcss);
 	module.exports = postcss;
 	postcss.default = postcss;
-})))(), 1);
-var postcss_default = import_postcss.default;
-import_postcss.default.stringify;
-import_postcss.default.fromJSON;
-import_postcss.default.plugin;
-import_postcss.default.parse;
-import_postcss.default.list;
-import_postcss.default.document;
-import_postcss.default.comment;
-import_postcss.default.atRule;
-import_postcss.default.rule;
-import_postcss.default.decl;
-import_postcss.default.root;
-import_postcss.default.CssSyntaxError;
-import_postcss.default.Declaration;
-import_postcss.default.Container;
-import_postcss.default.Processor;
-import_postcss.default.Document;
-import_postcss.default.Comment;
-import_postcss.default.Warning;
-import_postcss.default.AtRule;
-import_postcss.default.Result;
-import_postcss.default.Input;
-import_postcss.default.Rule;
-import_postcss.default.Root;
-import_postcss.default.Node;
+}));
 //#endregion
-//#region ../dsgraph-adapters/dist/css-values.js
-/** Splits at top-level separators, ignoring those inside parentheses and quotes. */
-function splitTopLevel(input, sep) {
-	const out = [];
-	let depth = 0;
-	let quote = "";
-	let cur = "";
-	for (const ch of input) {
-		if (quote) {
-			cur += ch;
-			if (ch === quote) quote = "";
-			continue;
+//#region ../../node_modules/postcss-scss/lib/nested-declaration.js
+var require_nested_declaration = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	const { Container } = require_postcss();
+	var NestedDeclaration = class extends Container {
+		constructor(defaults) {
+			super(defaults);
+			this.type = "decl";
+			this.isNested = true;
+			if (!this.nodes) this.nodes = [];
 		}
-		if (ch === "\"" || ch === "'") quote = ch;
-		else if (ch === "(") depth++;
-		else if (ch === ")") depth--;
-		if ((sep === " " ? /\s/.test(ch) : ch === sep) && depth === 0) {
-			if (cur.trim() !== "") out.push(cur.trim());
-			cur = "";
-		} else cur += ch;
-	}
-	if (cur.trim() !== "") out.push(cur.trim());
-	return out;
-}
-/** `var(--name)` or `var(--name, fallback)` spanning the whole value. */
-function parseVar(value) {
-	const v = value.trim();
-	if (!v.startsWith("var(") || !v.endsWith(")")) return void 0;
-	let depth = 0;
-	for (let i = 3; i < v.length; i++) if (v[i] === "(") depth++;
-	else if (v[i] === ")") {
-		depth--;
-		if (depth === 0 && i !== v.length - 1) return void 0;
-	}
-	const [name, ...rest] = splitTopLevel(v.slice(4, -1), ",");
-	if (!name || !/^--[\w\\.-]+$/.test(name.trim())) return void 0;
-	const result = { name: name.trim() };
-	if (rest.length > 0) result.fallback = rest.join(", ");
-	return result;
-}
-/** Token id for a custom property name: drops the leading `--`; dots (only possible escaped) become `_`. */
-const idFromCustomProperty = (prop) => prop.replace(/^--/, "").replace(/\\?\./g, "_");
-const LENGTH = /^(-?(?:\d+\.?\d*|\.\d+))(px|rem|em|%|vw|vh|vmin|vmax|ch|ex|pt|cqw|cqh|cqi|dvh|svh|lvh|lh|rlh)$/i;
-const NUMBER = /^-?(?:\d+\.?\d*|\.\d+)$/;
-const DURATION = /^(-?(?:\d+\.?\d*|\.\d+))(ms|s)$/;
-const EASINGS = {
-	ease: [
-		.25,
-		.1,
-		.25,
-		1
-	],
-	"ease-in": [
-		.42,
-		0,
-		1,
-		1
-	],
-	"ease-out": [
-		0,
-		0,
-		.58,
-		1
-	],
-	"ease-in-out": [
-		.42,
-		0,
-		.58,
-		1
-	],
-	linear: [
-		0,
-		0,
-		1,
-		1
-	]
-};
-const FONT_WEIGHT_WORDS = /* @__PURE__ */ new Set([
-	"normal",
-	"bold",
-	"light",
-	"medium",
-	"thin",
-	"black",
-	"regular",
-	"semi-bold",
-	"extra-bold"
-]);
-const GENERIC_FAMILIES = /* @__PURE__ */ new Set([
-	"serif",
-	"sans-serif",
-	"monospace",
-	"cursive",
-	"fantasy",
-	"system-ui",
-	"ui-sans-serif",
-	"ui-serif",
-	"ui-monospace",
-	"ui-rounded",
-	"emoji",
-	"math"
-]);
-const NON_COLORS = /* @__PURE__ */ new Set([
+	};
+	module.exports = NestedDeclaration;
+}));
+//#endregion
+//#region ../../node_modules/postcss-scss/lib/scss-tokenize.js
+var require_scss_tokenize = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	const SINGLE_QUOTE = "'".charCodeAt(0);
+	const DOUBLE_QUOTE = "\"".charCodeAt(0);
+	const BACKSLASH = "\\".charCodeAt(0);
+	const SLASH = "/".charCodeAt(0);
+	const NEWLINE = "\n".charCodeAt(0);
+	const SPACE = " ".charCodeAt(0);
+	const FEED = "\f".charCodeAt(0);
+	const TAB = "	".charCodeAt(0);
+	const CR = "\r".charCodeAt(0);
+	const OPEN_SQUARE = "[".charCodeAt(0);
+	const CLOSE_SQUARE = "]".charCodeAt(0);
+	const OPEN_PARENTHESES = "(".charCodeAt(0);
+	const CLOSE_PARENTHESES = ")".charCodeAt(0);
+	const OPEN_CURLY = "{".charCodeAt(0);
+	const CLOSE_CURLY = "}".charCodeAt(0);
+	const SEMICOLON = ";".charCodeAt(0);
+	const ASTERISK = "*".charCodeAt(0);
+	const COLON = ":".charCodeAt(0);
+	const AT = "@".charCodeAt(0);
+	const COMMA = ",".charCodeAt(0);
+	const HASH = "#".charCodeAt(0);
+	const RE_AT_END = /[\t\n\f\r "#'()/;[\\\]{}]/g;
+	const RE_WORD_END = /[,\t\n\f\r !"#'():;@[\\\]{}]|\/(?=\*)/g;
+	const RE_BAD_BRACKET = /.[\r\n"'(/\\]/;
+	const RE_HEX_ESCAPE = /[\da-f]/i;
+	const RE_NEW_LINE = /[\n\f\r]/g;
+	module.exports = function scssTokenize(input, options = {}) {
+		let css = input.css.valueOf();
+		let ignore = options.ignoreErrors;
+		let code, next, quote, content, escape;
+		let escaped, prev, n, currentToken;
+		let length = css.length;
+		let pos = 0;
+		let buffer = [];
+		let returned = [];
+		let brackets;
+		function position() {
+			return pos;
+		}
+		function unclosed(what) {
+			throw input.error("Unclosed " + what, pos);
+		}
+		function endOfFile() {
+			return returned.length === 0 && pos >= length;
+		}
+		function interpolation() {
+			let deep = 1;
+			let stringQuote = false;
+			let stringEscaped = false;
+			while (deep > 0) {
+				next += 1;
+				if (css.length <= next) unclosed("interpolation");
+				code = css.charCodeAt(next);
+				n = css.charCodeAt(next + 1);
+				if (stringQuote) {
+					if (!stringEscaped && code === stringQuote) {
+						stringQuote = false;
+						stringEscaped = false;
+					} else if (code === BACKSLASH) stringEscaped = !stringEscaped;
+					else if (stringEscaped) stringEscaped = false;
+				} else if (code === SINGLE_QUOTE || code === DOUBLE_QUOTE) stringQuote = code;
+				else if (code === CLOSE_CURLY) deep -= 1;
+				else if (code === HASH && n === OPEN_CURLY) deep += 1;
+			}
+		}
+		function nextToken(opts) {
+			if (returned.length) return returned.pop();
+			if (pos >= length) return void 0;
+			let ignoreUnclosed = opts ? opts.ignoreUnclosed : false;
+			code = css.charCodeAt(pos);
+			switch (code) {
+				case NEWLINE:
+				case SPACE:
+				case TAB:
+				case CR:
+				case FEED:
+					next = pos;
+					do {
+						next += 1;
+						code = css.charCodeAt(next);
+					} while (code === SPACE || code === NEWLINE || code === TAB || code === CR || code === FEED);
+					currentToken = ["space", css.slice(pos, next)];
+					pos = next - 1;
+					break;
+				case OPEN_SQUARE:
+				case CLOSE_SQUARE:
+				case OPEN_CURLY:
+				case CLOSE_CURLY:
+				case COLON:
+				case SEMICOLON:
+				case CLOSE_PARENTHESES: {
+					let controlChar = String.fromCharCode(code);
+					currentToken = [
+						controlChar,
+						controlChar,
+						pos
+					];
+					break;
+				}
+				case COMMA:
+					currentToken = [
+						"word",
+						",",
+						pos,
+						pos + 1
+					];
+					break;
+				case OPEN_PARENTHESES:
+					prev = buffer.length ? buffer.pop()[1] : "";
+					n = css.charCodeAt(pos + 1);
+					if (prev === "url" && n !== SINGLE_QUOTE && n !== DOUBLE_QUOTE) {
+						brackets = 1;
+						escaped = false;
+						next = pos + 1;
+						while (next <= css.length - 1) {
+							n = css.charCodeAt(next);
+							if (n === BACKSLASH) escaped = !escaped;
+							else if (n === OPEN_PARENTHESES) brackets += 1;
+							else if (n === CLOSE_PARENTHESES) {
+								brackets -= 1;
+								if (brackets === 0) break;
+							}
+							next += 1;
+						}
+						content = css.slice(pos, next + 1);
+						currentToken = [
+							"brackets",
+							content,
+							pos,
+							next
+						];
+						pos = next;
+					} else {
+						next = css.indexOf(")", pos + 1);
+						content = css.slice(pos, next + 1);
+						if (next === -1 || RE_BAD_BRACKET.test(content)) currentToken = [
+							"(",
+							"(",
+							pos
+						];
+						else {
+							currentToken = [
+								"brackets",
+								content,
+								pos,
+								next
+							];
+							pos = next;
+						}
+					}
+					break;
+				case SINGLE_QUOTE:
+				case DOUBLE_QUOTE:
+					quote = code;
+					next = pos;
+					escaped = false;
+					while (next < length) {
+						next++;
+						if (next === length) unclosed("string");
+						code = css.charCodeAt(next);
+						n = css.charCodeAt(next + 1);
+						if (!escaped && code === quote) break;
+						else if (code === BACKSLASH) escaped = !escaped;
+						else if (escaped) escaped = false;
+						else if (code === HASH && n === OPEN_CURLY) interpolation();
+					}
+					currentToken = [
+						"string",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+					break;
+				case AT:
+					RE_AT_END.lastIndex = pos + 1;
+					RE_AT_END.test(css);
+					if (RE_AT_END.lastIndex === 0) next = css.length - 1;
+					else next = RE_AT_END.lastIndex - 2;
+					currentToken = [
+						"at-word",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+					break;
+				case BACKSLASH:
+					next = pos;
+					escape = true;
+					while (css.charCodeAt(next + 1) === BACKSLASH) {
+						next += 1;
+						escape = !escape;
+					}
+					code = css.charCodeAt(next + 1);
+					if (escape && code !== SLASH && code !== SPACE && code !== NEWLINE && code !== TAB && code !== CR && code !== FEED) {
+						next += 1;
+						if (RE_HEX_ESCAPE.test(css.charAt(next))) {
+							while (RE_HEX_ESCAPE.test(css.charAt(next + 1))) next += 1;
+							if (css.charCodeAt(next + 1) === SPACE) next += 1;
+						}
+					}
+					currentToken = [
+						"word",
+						css.slice(pos, next + 1),
+						pos,
+						next
+					];
+					pos = next;
+					break;
+				default:
+					n = css.charCodeAt(pos + 1);
+					if (code === HASH && n === OPEN_CURLY) {
+						next = pos;
+						interpolation();
+						content = css.slice(pos, next + 1);
+						currentToken = [
+							"word",
+							content,
+							pos,
+							next
+						];
+						pos = next;
+					} else if (code === SLASH && n === ASTERISK) {
+						next = css.indexOf("*/", pos + 2) + 1;
+						if (next === 0) {
+							if (ignore || ignoreUnclosed) next = css.length;
+							else unclosed("comment");
+						}
+						currentToken = [
+							"comment",
+							css.slice(pos, next + 1),
+							pos,
+							next
+						];
+						pos = next;
+					} else if (code === SLASH && n === SLASH) {
+						RE_NEW_LINE.lastIndex = pos + 1;
+						RE_NEW_LINE.test(css);
+						if (RE_NEW_LINE.lastIndex === 0) next = css.length - 1;
+						else next = RE_NEW_LINE.lastIndex - 2;
+						content = css.slice(pos, next + 1);
+						currentToken = [
+							"comment",
+							content,
+							pos,
+							next,
+							"inline"
+						];
+						pos = next;
+					} else {
+						RE_WORD_END.lastIndex = pos + 1;
+						RE_WORD_END.test(css);
+						if (RE_WORD_END.lastIndex === 0) next = css.length - 1;
+						else next = RE_WORD_END.lastIndex - 2;
+						currentToken = [
+							"word",
+							css.slice(pos, next + 1),
+							pos,
+							next
+						];
+						buffer.push(currentToken);
+						pos = next;
+					}
+			}
+			pos++;
+			return currentToken;
+		}
+		function back(token) {
+			returned.push(token);
+		}
+		return {
+			back,
+			endOfFile,
+			nextToken,
+			position
+		};
+	};
+}));
+//#endregion
+//#region ../../node_modules/postcss-scss/lib/scss-parser.js
+var require_scss_parser = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { Comment } = require_postcss();
+	let Parser = require_parser();
+	let NestedDeclaration = require_nested_declaration();
+	let scssTokenizer = require_scss_tokenize();
+	var ScssParser = class extends Parser {
+		atrule(token) {
+			let name = token[1];
+			let prev = token;
+			while (!this.tokenizer.endOfFile()) {
+				let next = this.tokenizer.nextToken();
+				if (next[0] === "word" && next[2] === prev[3] + 1) {
+					name += next[1];
+					prev = next;
+				} else {
+					this.tokenizer.back(next);
+					break;
+				}
+			}
+			super.atrule([
+				"at-word",
+				name,
+				token[2],
+				prev[3]
+			]);
+		}
+		comment(token) {
+			if (token[4] === "inline") {
+				let node = new Comment();
+				this.init(node, token[2]);
+				node.raws.inline = true;
+				let pos = this.input.fromOffset(token[3]);
+				node.source.end = {
+					column: pos.col,
+					line: pos.line,
+					offset: token[3] + 1
+				};
+				let text = token[1].slice(2);
+				if (/^\s*$/.test(text)) {
+					node.text = "";
+					node.raws.left = text;
+					node.raws.right = "";
+				} else {
+					let match = text.match(/^(\s*)([^]*\S)(\s*)$/);
+					node.text = match[2].replace(/(\*\/|\/\*)/g, "*//*");
+					node.raws.left = match[1];
+					node.raws.right = match[3];
+					node.raws.text = match[2];
+				}
+			} else super.comment(token);
+		}
+		createTokenizer() {
+			this.tokenizer = scssTokenizer(this.input);
+		}
+		raw(node, prop, tokens, customProperty) {
+			super.raw(node, prop, tokens, customProperty);
+			if (node.raws[prop]) {
+				let scss = node.raws[prop].raw;
+				node.raws[prop].raw = tokens.reduce((all, i) => {
+					if (i[0] === "comment" && i[4] === "inline") {
+						let text = i[1].slice(2).replace(/(\*\/|\/\*)/g, "*//*");
+						return all + "/*" + text + "*/";
+					} else return all + i[1];
+				}, "");
+				if (scss !== node.raws[prop].raw) node.raws[prop].scss = scss;
+			}
+		}
+		rule(tokens) {
+			let withColon = false;
+			let brackets = 0;
+			let value = "";
+			for (let i of tokens) if (withColon) {
+				if (i[0] !== "comment" && i[0] !== "{") value += i[1];
+			} else if (i[0] === "space" && i[1].includes("\n")) break;
+			else if (i[0] === "(") brackets += 1;
+			else if (i[0] === ")") brackets -= 1;
+			else if (brackets === 0 && i[0] === ":") withColon = true;
+			if (!withColon || value.trim() === "" || /^[#:A-Za-z-]/.test(value)) super.rule(tokens);
+			else {
+				tokens.pop();
+				let node = new NestedDeclaration();
+				this.init(node, tokens[0][2]);
+				let last;
+				for (let i = tokens.length - 1; i >= 0; i--) if (tokens[i][0] !== "space") {
+					last = tokens[i];
+					break;
+				}
+				if (last[3]) {
+					let pos = this.input.fromOffset(last[3]);
+					node.source.end = {
+						column: pos.col,
+						line: pos.line,
+						offset: last[3] + 1
+					};
+				} else {
+					let pos = this.input.fromOffset(last[2]);
+					node.source.end = {
+						column: pos.col,
+						line: pos.line,
+						offset: last[2] + 1
+					};
+				}
+				while (tokens[0][0] !== "word") node.raws.before += tokens.shift()[1];
+				if (tokens[0][2]) {
+					let pos = this.input.fromOffset(tokens[0][2]);
+					node.source.start = {
+						column: pos.col,
+						line: pos.line,
+						offset: tokens[0][2]
+					};
+				}
+				node.prop = "";
+				while (tokens.length) {
+					let type = tokens[0][0];
+					if (type === ":" || type === "space" || type === "comment") break;
+					node.prop += tokens.shift()[1];
+				}
+				node.raws.between = "";
+				let token;
+				while (tokens.length) {
+					token = tokens.shift();
+					if (token[0] === ":") {
+						node.raws.between += token[1];
+						break;
+					} else node.raws.between += token[1];
+				}
+				if (node.prop[0] === "_" || node.prop[0] === "*") {
+					node.raws.before += node.prop[0];
+					node.prop = node.prop.slice(1);
+				}
+				node.raws.between += this.spacesAndCommentsFromStart(tokens);
+				this.precheckMissedSemicolon(tokens);
+				for (let i = tokens.length - 1; i > 0; i--) {
+					token = tokens[i];
+					if (token[1] === "!important") {
+						node.important = true;
+						let string = this.stringFrom(tokens, i);
+						string = this.spacesFromEnd(tokens) + string;
+						if (string !== " !important") node.raws.important = string;
+						break;
+					} else if (token[1] === "important") {
+						let cache = tokens.slice(0);
+						let str = "";
+						for (let j = i; j > 0; j--) {
+							let type = cache[j][0];
+							if (str.trim().indexOf("!") === 0 && type !== "space") break;
+							str = cache.pop()[1] + str;
+						}
+						if (str.trim().indexOf("!") === 0) {
+							node.important = true;
+							node.raws.important = str;
+							tokens = cache;
+						}
+					}
+					if (token[0] !== "space" && token[0] !== "comment") break;
+				}
+				this.raw(node, "value", tokens);
+				if (node.value.includes(":")) this.checkMissedSemicolon(tokens);
+				this.current = node;
+			}
+		}
+	};
+	module.exports = ScssParser;
+}));
+//#endregion
+//#region ../../node_modules/postcss-scss/lib/scss-parse.js
+var require_scss_parse = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let { Input } = require_postcss();
+	let ScssParser = require_scss_parser();
+	module.exports = function scssParse(scss, opts) {
+		let input = new Input(scss, opts);
+		let parser = new ScssParser(input);
+		parser.parse();
+		return parser.root;
+	};
+}));
+//#endregion
+//#region ../../node_modules/postcss-scss/lib/scss-syntax.mjs
+var import_scss_syntax = /* @__PURE__ */ __toESM((/* @__PURE__ */ __commonJSMin(((exports, module) => {
+	let stringify = require_scss_stringify();
+	module.exports = {
+		parse: require_scss_parse(),
+		stringify
+	};
+})))(), 1);
+var scss_syntax_default = import_scss_syntax.default;
+import_scss_syntax.default.stringify;
+import_scss_syntax.default.parse;
+//#endregion
+//#region ../dsgraph-adapters/dist/styles.js
+const DEFAULT_INCLUDE = ["**/*.css", "**/*.scss"];
+const DEFAULT_EXCLUDE = [
+	"**/node_modules/**",
+	"**/.git/**",
+	"**/dist/**",
+	"**/build/**",
+	"**/out/**",
+	"**/.next/**",
+	"**/coverage/**",
+	"**/*.min.css"
+];
+/** Properties whose colors are worth a token. Named colors (`red`) count only here. */
+const COLOR_PROPERTY = /^(color|background(-color)?|border(-(top|right|bottom|left|block|inline)(-(start|end))?)?(-color)?|outline(-color)?|fill|stroke|(box|text)-shadow|caret-color|accent-color|text-decoration(-color)?|column-rule(-color)?|scrollbar-color)$/i;
+/** Properties that take values from a spacing, radius or type scale. */
+const SCALE_PROPERTY = /^(margin|padding|inset|scroll-(margin|padding))(-(top|right|bottom|left|block|inline)(-(start|end))?)?$|^(gap|row-gap|column-gap|top|right|bottom|left|font-size)$|^border(-(top|bottom|start|end)-(left|right|start|end))?-radius$/i;
+const NOT_A_COLOR = /* @__PURE__ */ new Set([
+	"transparent",
+	"currentcolor",
 	"inherit",
 	"initial",
 	"unset",
 	"revert",
-	"currentcolor",
-	"none"
+	"none",
+	"auto"
 ]);
-const hint = (name, words) => words.test(name.toLowerCase());
-const isDimensionName = (n) => hint(n, /(space|spacing|size|radius|width|height|gap|inset|offset|gutter|padding|margin|indent|blur|spread|border-w)/);
-/** A sub-value inside a composite: a reference, a color or a length. */
-function subValue(part, expect) {
-	const v = parseVar(part);
-	if (v) return `{${idFromCustomProperty(v.name)}}`;
-	if (expect === "color") return cssColorToDtcg(part);
-	const m = LENGTH.exec(part);
-	if (m) return {
-		value: Number(m[1]),
-		unit: m[2].toLowerCase()
-	};
-	if (part === "0") return {
-		value: 0,
-		unit: "px"
-	};
+const COLOR_FUNCTION = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(/i;
+const HEX = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+const LENGTH = /^(-?)(\d+\.?\d*|\.\d+)(px|rem)$/i;
+/** A parsed CSS color as the canonical value tokens hold, so code and tokens compare directly. */
+function canonicalColor(css) {
+	const dtcg = cssColorToDtcg(css);
+	if (!dtcg) return void 0;
+	return canonicalValue("color", dtcg, {
+		strict: false,
+		allowNonstandardUnits: true,
+		diag: new DiagnosticBag(),
+		flags: /* @__PURE__ */ new Set()
+	});
 }
-function parseShadow(value) {
-	const layers = [];
-	for (const layer of splitTopLevel(value, ",")) {
-		const parts = splitTopLevel(layer, " ");
-		let inset = false;
-		let color;
-		const lengths = [];
-		for (const p of parts) if (p.toLowerCase() === "inset") inset = true;
-		else {
-			const len = subValue(p, "dimension");
-			if (len !== void 0 && (typeof len !== "string" || lengths.length < 2)) lengths.push(len);
-			else {
-				const c = subValue(p, "color");
-				if (c === void 0 || color !== void 0) return void 0;
-				color = c;
-			}
-		}
-		if (lengths.length < 2 || lengths.length > 4 || color === void 0) return void 0;
-		const zero = {
-			value: 0,
-			unit: "px"
-		};
-		layers.push({
-			color,
-			offsetX: lengths[0],
-			offsetY: lengths[1],
-			blur: lengths[2] ?? zero,
-			spread: lengths[3] ?? zero,
-			inset
-		});
-	}
-	return layers.length > 0 ? layers : void 0;
-}
-/**
-* Infers a DTCG type for a custom property value. Whole `var()` becomes an alias (type comes from
-* the target); anything that cannot be represented becomes a `css-expression` that keeps its text.
-*/
-function cssValueToToken(prop, raw) {
-	const value = raw.trim();
-	const name = prop.replace(/^--/, "");
-	const ref = parseVar(value);
-	if (ref) return { $value: `{${idFromCustomProperty(ref.name)}}` };
-	const lower = value.toLowerCase();
-	if (!NON_COLORS.has(lower)) {
-		const color = cssColorToDtcg(value);
-		if (color && !NUMBER.test(value)) return {
-			$type: "color",
-			$value: color
-		};
-	}
-	let m = LENGTH.exec(value);
-	if (m) return {
-		$type: "dimension",
-		$value: {
-			value: Number(m[1]),
-			unit: m[2].toLowerCase()
-		}
-	};
-	m = DURATION.exec(value);
-	if (m) return {
-		$type: "duration",
-		$value: {
-			value: Number(m[1]),
-			unit: m[2]
-		}
-	};
-	if (NUMBER.test(value)) {
-		const n = Number(value);
-		if (hint(name, /weight/) && n >= 1 && n <= 1e3) return {
-			$type: "fontWeight",
-			$value: n
-		};
-		if (n === 0 && isDimensionName(name)) return {
-			$type: "dimension",
-			$value: {
-				value: 0,
-				unit: "px"
-			}
-		};
-		return {
-			$type: "number",
-			$value: n
-		};
-	}
-	if (hint(name, /weight/) && FONT_WEIGHT_WORDS.has(lower)) return {
-		$type: "fontWeight",
-		$value: lower
-	};
-	const bezier = /^cubic-bezier\(([^)]*)\)$/i.exec(value);
-	if (bezier) {
-		const nums = bezier[1].split(",").map((s) => Number(s.trim()));
-		if (nums.length === 4 && nums.every(Number.isFinite)) return {
-			$type: "cubicBezier",
-			$value: nums
-		};
-	}
-	if (EASINGS[lower] && hint(name, /(ease|easing|timing|curve|motion)/)) return {
-		$type: "cubicBezier",
-		$value: EASINGS[lower]
-	};
-	const families = splitTopLevel(value, ",");
-	if (families.length > 1 && families.every((f) => /^(["'][^"']+["']|[\w -]+)$/.test(f)) && families.some((f) => GENERIC_FAMILIES.has(f.toLowerCase()) || /^["']/.test(f)) || hint(name, /(font-family|family|typeface|font-sans|font-serif|font-mono)/) && families.length >= 1 && !value.includes("(")) return {
-		$type: "fontFamily",
-		$value: families.map((f) => f.replace(/^["']|["']$/g, ""))
-	};
-	if (hint(name, /shadow|elevation/) || /\d(px|rem)?\s+-?\d/.test(value)) {
-		const shadow = parseShadow(value);
-		if (shadow) return {
-			$type: "shadow",
-			$value: shadow
-		};
-	}
-	return {
-		$type: "css-expression",
-		$value: value
-	};
-}
-//#endregion
-//#region ../dsgraph-adapters/dist/css-tokens.js
-const ROOT_LIKE = /^(:root|html|:host|body|\*)(:not\([^)]*\))*$/;
-const ATTR_THEME = /^(?::root|html|body|:host)?\[(data-[\w-]+)(?:=["']?([\w-]+)["']?)?\](:not\([^)]*\))*$/;
-const CLASS_THEME = /^(?::root|html|body|:host)?\.(dark|light|theme-([\w-]+)|([\w-]+)-theme)(:not\([^)]*\))*$/;
-const COLOR_SCHEME = /prefers-color-scheme\s*:\s*(dark|light)/i;
-/** Several attributes at once: `[data-color-mode="dark"][data-dark-theme="dark_dimmed"]`. */
-const COMPOUND_ATTR = /^(?::root|html|body|:host)?((?:\[data-[\w-]+(?:=["']?[\w-]+["']?)?\]){2,})(:not\([^)]*\))*$/;
-const norm = (s) => s.replace(/\s+/g, " ").replace(/["']/g, "").trim().toLowerCase();
-/** Conditional at-rules around a declaration, outermost first (`@layer` is ignored). */
-function atRulesOf(decl) {
+/** Every `var(--name, fallback)` in a value, nested ones included. */
+function varsIn(value) {
 	const out = [];
-	let node = decl.parent?.parent;
-	while (node && node.type !== "root") {
-		if (node.type === "atrule") {
-			const at = node;
-			if (at.name !== "layer") out.unshift(`@${at.name} ${norm(at.params)}`);
-		}
-		node = node.parent;
+	const re = /var\(\s*(--[\w-]+)\s*/gi;
+	for (let m = re.exec(value); m; m = re.exec(value)) {
+		let depth = 1;
+		let i = re.lastIndex;
+		for (; i < value.length && depth > 0; i++) if (value[i] === "(") depth++;
+		else if (value[i] === ")") depth--;
+		const rest = value.slice(re.lastIndex, i - 1).trim();
+		const use = { name: m[1] };
+		if (rest.startsWith(",")) use.fallback = rest.slice(1).trim();
+		out.push(use);
 	}
 	return out;
 }
-/** Well-known conditions under the names people use for them. */
-const KNOWN_CONDITIONS = [
-	[/display-p3|color-gamut\s*:\s*p3/, "display-p3"],
-	[/color-gamut\s*:\s*rec2020/, "rec2020"],
-	[/prefers-reduced-motion\s*:\s*reduce/, "reduced-motion"],
-	[/prefers-contrast\s*:\s*more/, "high-contrast"],
-	[/prefers-contrast\s*:\s*less/, "low-contrast"],
-	[/forced-colors\s*:\s*active/, "forced-colors"]
-];
-/**
-* A short modifier name for an at-rule: `@media (min-width: 768px)` → `min-width: 768px`,
-* `@supports (color: color(display-p3 1 1 1))` → `display-p3`.
-*/
-function conditionName(atRule) {
-	for (const [re, name] of KNOWN_CONDITIONS) if (re.test(atRule)) return name;
-	const m = /^@(\w+)\s*(.*)$/.exec(atRule.trim());
-	if (!m) return atRule;
-	const params = m[2].replace(/^\((.*)\)$/, "$1").replace(/\(([^()]*)\)/g, "").replace(/\s+/g, " ").trim();
-	return m[1] === "media" ? params : `${m[1]} ${params}`;
-}
-function autoPlacement(selectors, atRules) {
-	const media = atRules.find((a) => !COLOR_SCHEME.test(a));
-	const scheme = atRules.map((a) => COLOR_SCHEME.exec(a)?.[1]?.toLowerCase()).find(Boolean);
-	for (const raw of selectors) {
-		const sel = raw.replace(/\s+/g, "");
-		if (ROOT_LIKE.test(sel)) {
-			if (media) return {
-				kind: "context",
-				modifier: conditionName(media),
-				context: "on",
-				boolean: true
-			};
-			if (scheme) return {
-				kind: "context",
-				modifier: "theme",
-				context: scheme
-			};
-			return { kind: "base" };
-		}
-		const attr = ATTR_THEME.exec(sel);
-		if (attr && !media) return {
-			kind: "context",
-			modifier: attr[1].replace(/^data-/, ""),
-			context: attr[2] ?? "on"
-		};
-		const cls = CLASS_THEME.exec(sel);
-		if (cls && !media) return {
-			kind: "context",
-			modifier: "theme",
-			context: cls[2] ?? cls[3] ?? cls[1]
-		};
-		const compound = COMPOUND_ATTR.exec(sel);
-		if (compound && !media) {
-			const values = [...compound[1].matchAll(/=["']?([\w-]+)["']?\]/g)].map((m) => m[1]);
-			if (values.length) return {
-				kind: "context",
-				modifier: "theme",
-				context: values[values.length - 1]
-			};
-		}
+/** Value parts outside `var()`, `url()` and other functions that are not colors. */
+function plainParts(value) {
+	const parts = [];
+	for (const item of splitTopLevel(value, ",")) for (const part of splitTopLevel(item, " ")) {
+		const p = part.trim();
+		if (!p) continue;
+		const fn = /^([\w-]+)\(/.exec(p);
+		if (fn && !COLOR_FUNCTION.test(p)) {
+			if (/^(var|url|env|image-set|format|local|color-mix)$/i.test(fn[1])) continue;
+			const inner = p.slice(fn[0].length, -1);
+			parts.push(...plainParts(/^(calc|clamp|min|max)$/i.test(fn[1]) ? inner.replace(/[+*/]/g, " ") : inner));
+		} else parts.push(p);
 	}
-	return { kind: "skip" };
+	return parts;
 }
-/** Configured placement: `css.contexts` patterns such as `[data-theme=dark]` or `@media (prefers-color-scheme: dark) :root`. */
-function configuredPlacement(selectors, atRules, contexts) {
-	const sels = selectors.map(norm);
-	for (const [modifier, ctxs] of Object.entries(contexts)) for (const [context, patterns] of Object.entries(ctxs)) for (const pattern of patterns) {
-		const m = /^(@\w+\s*\([^)]*\))?\s*(.*)$/.exec(pattern.trim());
-		const atPart = m[1] ? norm(m[1].replace(/^@(\w+)\s*/, "@$1 ")) : void 0;
-		const selPart = m[2] ? norm(m[2]) : void 0;
-		const atOk = atPart ? atRules.includes(atPart) : atRules.length === 0;
-		const selOk = selPart ? sels.includes(selPart) : sels.some((s) => ROOT_LIKE.test(s.replace(/\s+/g, "")));
-		if (atOk && selOk) return {
-			kind: "context",
-			modifier,
-			context
-		};
-	}
-}
-/**
-* CSS custom properties → token system (spec section 4.3). Root-like rules form the base set;
-* theme selectors and `prefers-color-scheme` become a `theme`-style modifier; other media queries
-* become independent on/off modifiers. Scoped variables (e.g. `.button { --x }`) are not tokens.
-*/
-const cssTokens = {
-	name: "tokens-css",
-	async detect(source, config) {
-		const exclude = excludeFor(config, "css");
-		const files = (await source.list(config.css?.include ?? ["**/*.css"])).filter((p) => !matchGlob(p, exclude));
-		if (config.css?.include) return files;
-		await prefetch(source, files);
-		const out = [];
-		for (const f of files) {
-			const text = await source.readText(f);
-			if (/--[\w-]+\s*:/.test(text) && /(:root|html|:host|\[data-|prefers-color-scheme|\.(dark|light)\b|\.theme-|-theme\b)/.test(text)) out.push(f);
+/** Colors and scale values written by hand in a declaration. */
+function literalsIn(property, value) {
+	const out = [];
+	const colorProperty = COLOR_PROPERTY.test(property);
+	const scaleProperty = SCALE_PROPERTY.test(property);
+	if (!colorProperty && !scaleProperty && !/^(background|border|outline)/i.test(property)) {
+		for (const p of plainParts(value)) if (HEX.test(p) || COLOR_FUNCTION.test(p)) {
+			const color = canonicalColor(p);
+			if (color) out.push({
+				text: p,
+				type: "color",
+				value: color
+			});
 		}
 		return out;
-	},
-	async load(source, files, config, diag) {
-		const configured = config.css?.contexts;
-		const base = [];
-		const modifiers = /* @__PURE__ */ new Map();
-		const orderOfModifiers = [];
-		await prefetch(source, files);
-		for (const file of [...files].sort()) {
-			let root;
-			try {
-				root = postcss_default.parse(await source.readText(file), { from: file });
-			} catch (e) {
-				diag.error("css/parse-error", e.message, { file });
+	}
+	for (const p of plainParts(value)) {
+		const lower = p.toLowerCase();
+		if (HEX.test(p) || COLOR_FUNCTION.test(p) || colorProperty && /^[a-z]+$/.test(lower) && !NOT_A_COLOR.has(lower)) {
+			const color = canonicalColor(p);
+			if (color) {
+				out.push({
+					text: p,
+					type: "color",
+					value: color
+				});
 				continue;
 			}
-			const baseTree = {};
-			const contextTrees = /* @__PURE__ */ new Map();
-			let skipped = 0;
-			root.walkDecls((decl) => {
-				if (!decl.prop.startsWith("--")) return;
-				const rule = decl.parent;
-				if (rule?.type !== "rule") {
-					skipped++;
-					return;
-				}
-				const selectors = rule.selectors;
-				const atRules = atRulesOf(decl);
-				const placement = (configured && configuredPlacement(selectors, atRules, configured)) ?? (configured ? selectors.some((s) => ROOT_LIKE.test(s.replace(/\s+/g, ""))) && atRules.length === 0 ? { kind: "base" } : { kind: "skip" } : autoPlacement(selectors, atRules));
-				if (placement.kind === "skip") {
-					skipped++;
-					return;
-				}
-				const id = idFromCustomProperty(decl.prop);
-				const entry = cssValueToToken(decl.prop, decl.value);
-				const token = {
-					$value: entry.$value,
-					$extensions: { "dev.dsgraph": { css: decl.prop } }
-				};
-				if (entry.$type) {
-					token.$type = entry.$type;
-					token.$extensions["dev.dsgraph"].typeInferred = true;
-				}
-				if (placement.kind === "base") baseTree[id] = token;
-				else {
-					if (!modifiers.has(placement.modifier)) {
-						modifiers.set(placement.modifier, {
-							contexts: /* @__PURE__ */ new Map(),
-							boolean: placement.boolean ?? false
-						});
-						orderOfModifiers.push(placement.modifier);
-					}
-					const key = `${placement.modifier}\u0000${placement.context}`;
-					const tree = contextTrees.get(key) ?? {};
-					tree[id] = token;
-					contextTrees.set(key, tree);
-				}
-			});
-			if (skipped > 0) diag.info("css/scoped-variable", `${skipped} custom properties outside root or theme selectors are not tokens`, { file });
-			if (Object.keys(baseTree).length > 0) base.push({
+		}
+		const m = scaleProperty ? LENGTH.exec(p) : null;
+		if (m && Number(m[2]) !== 0 && !(m[3].toLowerCase() === "px" && Number(m[2]) <= 1)) out.push({
+			text: p,
+			type: "dimension",
+			value: {
+				value: Number(m[2]),
+				unit: m[3].toLowerCase()
+			}
+		});
+	}
+	return out;
+}
+function selectorOf(decl) {
+	const parent = decl.parent;
+	return parent && parent.type === "rule" ? parent.selector.replace(/\s+/g, " ") : void 0;
+}
+function parse(file, text) {
+	if (/\.scss$/i.test(file)) return scss_syntax_default.parse(text, { from: file });
+	return postcss_default.parse(text, { from: file });
+}
+/**
+* Reads a project's style files (CSS, SCSS, CSS modules): every `var(--…)` and every color or
+* scale value written by hand. Definitions of custom properties and SCSS variables are where values
+* are named, so their literals are not reported; their `var()` references are.
+*/
+async function scanStyles(source, opts = {}) {
+	const exclude = [...DEFAULT_EXCLUDE, ...opts.exclude ?? []];
+	const files = (await source.list(opts.include ?? DEFAULT_INCLUDE)).filter((f) => !matchGlob(f, exclude)).sort();
+	await prefetch(source, files);
+	const index = {
+		files: [],
+		uses: [],
+		literals: [],
+		skipped: []
+	};
+	for (const file of files) {
+		let root;
+		try {
+			root = parse(file, await source.readText(file));
+		} catch (e) {
+			index.skipped.push({
 				file,
-				tree: baseTree
+				message: e.message
 			});
-			for (const [key, tree] of contextTrees) {
-				const [modifier, context] = key.split("\0");
-				const m = modifiers.get(modifier);
-				m.contexts.set(context, [...m.contexts.get(context) ?? [], {
-					file,
-					tree
-				}]);
+			continue;
+		}
+		index.files.push(file);
+		root.walkDecls((decl) => {
+			const loc = {
+				file,
+				line: decl.source?.start?.line ?? 0,
+				column: decl.source?.start?.column ?? 0
+			};
+			const selector = selectorOf(decl);
+			const property = decl.prop;
+			for (const v of varsIn(decl.value)) {
+				const use = {
+					...loc,
+					name: v.name,
+					property
+				};
+				if (selector) use.selector = selector;
+				if (v.fallback !== void 0) use.fallback = v.fallback;
+				index.uses.push(use);
 			}
-		}
-		const system = {
-			sets: /* @__PURE__ */ new Map([["base", base]]),
-			modifiers: /* @__PURE__ */ new Map(),
-			order: [{
-				kind: "set",
-				name: "base"
-			}],
-			synthetic: true,
-			kind: "css"
-		};
-		for (const name of orderOfModifiers) {
-			const m = modifiers.get(name);
-			const contexts = /* @__PURE__ */ new Map();
-			let defaultContext;
-			if (m.boolean) {
-				contexts.set("off", []);
-				contexts.set("on", m.contexts.get("on") ?? []);
-				defaultContext = "off";
-			} else if (configured?.[name]) {
-				for (const ctx of Object.keys(configured[name])) contexts.set(ctx, m.contexts.get(ctx) ?? []);
-				defaultContext = Object.keys(configured[name])[0];
-			} else {
-				defaultContext = m.contexts.has("light") ? "light" : "default";
-				if (!m.contexts.has(defaultContext)) contexts.set(defaultContext, []);
-				for (const [ctx, docs] of m.contexts) contexts.set(ctx, docs);
+			if (property.startsWith("--") || property.startsWith("$") || property.startsWith("@")) return;
+			if (/#\{|\$[\w-]/.test(decl.value)) return;
+			for (const l of literalsIn(property, decl.value)) {
+				const lit = {
+					...loc,
+					property,
+					...l
+				};
+				if (selector) lit.selector = selector;
+				index.literals.push(lit);
 			}
-			system.modifiers.set(name, {
-				contexts,
-				default: defaultContext
-			});
-			system.order.push({
-				kind: "modifier",
-				name
-			});
-		}
-		if (base.length === 0 && modifiers.size === 0) diag.warn("tokens/no-files", "No CSS custom properties found in root or theme selectors");
-		return system;
+		});
 	}
-};
-//#endregion
-//#region ../dsgraph-adapters/dist/json-values.js
-/** Types of token-set and value/type JSON → DTCG types. Others keep their own name. */
-const TYPES = {
-	color: "color",
-	dimension: "dimension",
-	sizing: "dimension",
-	spacing: "dimension",
-	size: "dimension",
-	borderRadius: "dimension",
-	borderWidth: "dimension",
-	fontSizes: "dimension",
-	fontSize: "dimension",
-	letterSpacing: "dimension",
-	paragraphSpacing: "dimension",
-	paragraphIndent: "dimension",
-	opacity: "number",
-	number: "number",
-	fontFamilies: "fontFamily",
-	fontFamily: "fontFamily",
-	fontWeights: "fontWeight",
-	fontWeight: "fontWeight",
-	lineHeights: "lineHeight",
-	lineHeight: "lineHeight",
-	typography: "typography",
-	boxShadow: "shadow",
-	shadow: "shadow",
-	border: "border",
-	duration: "duration",
-	time: "duration",
-	easing: "cubicBezier",
-	cubicBezier: "cubicBezier",
-	strokeStyle: "strokeStyle",
-	transition: "transition",
-	gradient: "gradient"
-};
-/** `border-radius` (kebab-case types) → `borderRadius`. */
-const mapKey = (t) => t.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
-const mapType = (t) => TYPES[t] ?? TYPES[mapKey(t)] ?? t;
-/** Types only the token-set format uses; their presence tells it from plain value/type JSON. */
-const SET_FORMAT_TYPES = /* @__PURE__ */ new Set([
-	"sizing",
-	"spacing",
-	"borderRadius",
-	"borderWidth",
-	"fontSizes",
-	"fontFamilies",
-	"fontWeights",
-	"lineHeights",
-	"letterSpacing",
-	"paragraphSpacing",
-	"paragraphIndent",
-	"boxShadow",
-	"composition",
-	"textCase",
-	"textDecoration",
-	"opacity"
-]);
-const FONT_WEIGHTS = {
-	thin: 100,
-	hairline: 100,
-	extralight: 200,
-	ultralight: 200,
-	light: 300,
-	normal: 400,
-	regular: 400,
-	book: 400,
-	medium: 500,
-	semibold: 600,
-	demibold: 600,
-	bold: 700,
-	extrabold: 800,
-	ultrabold: 800,
-	black: 900,
-	heavy: 900,
-	extrablack: 950,
-	ultrablack: 950
-};
-const WHOLE_REF = /^\{[^{}]+\}$/;
-const NUM = /^\s*(-?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)\s*$/i;
-const isObj$1 = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
-/**
-* References as these tools write them, in DTCG syntax: `{a.b.value}` and `{a.b.$value}` drop the
-* suffix, a whole-value `$a.b` (an early notation) becomes `{a.b}`.
-*/
-function normalizeRefs(v) {
-	if (typeof v === "string") {
-		const s = v.replace(/\{([^{}]+?)\.\$?value\}/g, "{$1}");
-		return /^\$[\w-]+(\.[\w-]+)+$/.test(s) ? `{${s.slice(1)}}` : s;
-	}
-	if (Array.isArray(v)) return v.map(normalizeRefs);
-	if (isObj$1(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, normalizeRefs(x)]));
-	return v;
+	return index;
 }
-const hasRefInside = (s) => s.includes("{") && !WHOLE_REF.test(s.trim());
-const isArithmetic = (s) => /^[\d\s.+\-*/()a-z%]+$/i.test(s) && /\d\s*[-+*/]\s*[\d(.]/.test(s);
-/** A string that stays as text for the core: a reference or an expression with references. */
-function deferred(s, c) {
-	if (WHOLE_REF.test(s.trim())) return s.trim();
-	if (hasRefInside(s)) {
-		c.expression = true;
-		return s;
-	}
-}
-function dimension(v, c, percentAs) {
-	if (typeof v === "number") return {
-		value: v,
-		unit: v === 0 ? "px" : c.unit
-	};
-	if (typeof v !== "string") return v;
-	const d = deferred(v, c);
-	if (d !== void 0) return d;
-	const m = NUM.exec(v);
-	if (m) {
-		const n = Number(m[1]);
-		const unit = m[2].toLowerCase();
-		if (unit === "%" && percentAs === "em") return {
-			value: n / 100,
-			unit: "em"
-		};
-		return {
-			value: n,
-			unit: unit || c.unit
-		};
-	}
-	if (isArithmetic(v) || /^calc\(/i.test(v)) return evaluateExpression(v, "dimension", c.unit) ?? v;
-	return v;
-}
-function numberValue(v, c) {
-	if (typeof v !== "string") return v;
-	const d = deferred(v, c);
-	if (d !== void 0) return d;
-	const m = NUM.exec(v);
-	if (m && (m[2] === "" || m[2] === "%")) return m[2] === "%" ? Number(m[1]) / 100 : Number(m[1]);
-	return evaluateExpression(v, "number") ?? v;
-}
-function color(v, c) {
-	if (typeof v !== "string") return v;
-	const d = deferred(v, c);
-	if (d !== void 0) return d;
-	return cssColorToDtcg(v) ?? evaluateExpression(v, "color") ?? v;
-}
-function fontFamily(v) {
-	if (typeof v !== "string" || WHOLE_REF.test(v.trim())) return v;
-	const list = splitTopLevel(v, ",").map((f) => f.replace(/^["']|["']$/g, ""));
-	return list.length === 1 ? list[0] : list;
-}
-/** `Bold`, `Semi Bold Italic`, `700` → a number; unknown names stay as written. */
-function fontWeight(v) {
-	if (typeof v === "number" || typeof v !== "string" || WHOLE_REF.test(v.trim())) return v;
-	if (/^\d+$/.test(v.trim())) return Number(v);
-	const key = v.toLowerCase().replace(/\b(italic|oblique|(semi|extra|ultra)?\s*(condensed|compressed|expanded|extended)|narrow|wide)\b/g, "").replace(/[\s_-]/g, "");
-	return FONT_WEIGHTS[key === "" ? "regular" : key] ?? v;
-}
-/** Line height: a percentage or a small unitless number is a multiplier; a larger one is px. */
-function lineHeight(v, c) {
-	if (typeof v === "number") return v <= 4 ? {
-		type: "number",
-		value: v
-	} : {
-		type: "dimension",
-		value: {
-			value: v,
-			unit: c.unit
-		}
-	};
-	if (typeof v !== "string") return {
-		type: "number",
-		value: v
-	};
-	if (WHOLE_REF.test(v.trim())) return {
-		type: "",
-		value: v.trim()
-	};
-	const d = deferred(v, c);
-	if (d !== void 0) return {
-		type: "dimension",
-		value: d
-	};
-	if (/^auto$/i.test(v.trim())) return void 0;
-	const m = NUM.exec(v);
-	if (!m) return {
-		type: "number",
-		value: evaluateExpression(v, "number") ?? v
-	};
-	const n = Number(m[1]);
-	const unit = m[2].toLowerCase();
-	if (unit === "%") return {
-		type: "number",
-		value: n / 100
-	};
-	if (unit === "" && n <= 4) return {
-		type: "number",
-		value: n
-	};
-	return {
-		type: "dimension",
-		value: {
-			value: n,
-			unit: unit || c.unit
-		}
-	};
-}
-function typography(v, c) {
-	if (!isObj$1(v)) return v;
-	const out = { ...v };
-	if (v.fontFamily !== void 0) out.fontFamily = fontFamily(v.fontFamily);
-	if (v.fontWeight !== void 0) out.fontWeight = fontWeight(v.fontWeight);
-	if (v.fontSize !== void 0) out.fontSize = dimension(v.fontSize, c);
-	if (v.letterSpacing !== void 0) out.letterSpacing = dimension(v.letterSpacing, c, "em");
-	if (v.lineHeight !== void 0) {
-		const lh = lineHeight(v.lineHeight, c);
-		if (lh) out.lineHeight = lh.value;
-		else delete out.lineHeight;
-	}
-	for (const k of ["paragraphSpacing", "paragraphIndent"]) if (v[k] !== void 0) out[k] = dimension(v[k], c);
-	return out;
-}
-function shadowLayer(v, c) {
-	if (!isObj$1(v)) return v;
-	const out = {
-		color: color(v.color, c),
-		offsetX: dimension(v.offsetX ?? v.x ?? 0, c),
-		offsetY: dimension(v.offsetY ?? v.y ?? 0, c),
-		blur: dimension(v.blur ?? 0, c),
-		spread: dimension(v.spread ?? 0, c)
-	};
-	if (v.inset !== void 0) out.inset = v.inset;
-	else if (v.type === "innerShadow") out.inset = true;
-	return out;
-}
-function border(v, c) {
-	if (!isObj$1(v)) return v;
-	const out = { ...v };
-	if (v.color !== void 0) out.color = color(v.color, c);
-	if (v.width !== void 0) out.width = dimension(v.width, c);
-	return out;
-}
-function duration(v) {
-	if (typeof v === "number") return {
-		value: v,
-		unit: "ms"
-	};
-	if (typeof v !== "string") return v;
-	const m = NUM.exec(v);
-	if (m && (m[2] === "" || m[2] === "ms" || m[2] === "s")) return {
-		value: Number(m[1]),
-		unit: m[2] || "ms"
-	};
-	return v;
-}
-/** Category/type/item naming: the first path segment says what an untyped token is. */
-function inferType(path, v, c) {
-	const category = path[0]?.toLowerCase();
-	if (category === "color" || category === "colors") return {
-		type: "color",
-		value: color(v, c)
-	};
-	if (category === "size" || category === "sizes") return {
-		type: "dimension",
-		value: dimension(v, {
-			...c,
-			unit: "rem"
-		})
-	};
-	if (category === "time") return {
-		type: "duration",
-		value: duration(v)
-	};
-	if (typeof v === "string" && !v.includes("{") || typeof v === "number") {
-		const t = cssValueToToken(path.join("-"), String(v));
-		if (t.$type === void 0 || t.$type === "css-expression" || String(v).includes("var(")) return {
-			type: "other",
-			value: v
-		};
-		return {
-			type: t.$type,
-			value: t.$value
-		};
-	}
-	return {
-		type: "other",
-		value: v
-	};
-}
-/**
-* One token's value in DTCG form, by its (source) type. References and expressions with
-* references stay as text for the core; everything literal becomes a DTCG value.
-*/
-function convertValue(sourceType, raw, path, c) {
-	const v = normalizeRefs(raw);
-	if (sourceType === "other" && typeof v === "string" && WHOLE_REF.test(v.trim())) return { value: v.trim() };
-	if (sourceType === "other" && (typeof v === "number" || typeof v === "string" && !v.includes("{"))) {
-		const t = inferType(path, v, c);
-		return t.type === "other" ? {
-			type: "other",
-			value: v
-		} : {
-			...t,
-			inferred: true
-		};
-	}
-	if (sourceType === void 0) {
-		if (typeof v === "string" && v.includes("{")) {
-			deferred(v, c);
-			return { value: v };
-		}
-		return {
-			...inferType(path, v, c),
-			inferred: true
-		};
-	}
-	const type = mapType(sourceType);
-	const css = (value) => typeof value === "string" && !value.includes("{") ? {
-		type: "css-expression",
-		value
-	} : {
-		type,
-		value
-	};
-	switch (type) {
-		case "color":
-			if (typeof v === "string" && /gradient\(/i.test(v)) return {
-				type: "css-expression",
-				value: v
-			};
-			return css(color(v, c));
-		case "dimension": return css(dimension(v, c, /letterSpacing/.test(mapKey(sourceType)) ? "em" : void 0));
-		case "number": return {
-			type,
-			value: numberValue(v, c)
-		};
-		case "fontFamily": return {
-			type,
-			value: fontFamily(v)
-		};
-		case "fontWeight": return {
-			type,
-			value: fontWeight(v)
-		};
-		case "lineHeight": {
-			const lh = lineHeight(v, c);
-			if (!lh) return {
-				type: sourceType,
-				value: v
-			};
-			return lh.type ? lh : { value: lh.value };
-		}
-		case "typography": return {
-			type,
-			value: typography(v, c)
-		};
-		case "shadow": return {
-			type,
-			value: Array.isArray(v) ? v.map((l) => shadowLayer(l, c)) : shadowLayer(v, c)
-		};
-		case "border": return {
-			type,
-			value: border(v, c)
-		};
-		case "duration": return {
-			type,
-			value: duration(v)
-		};
-		default:
-			if (typeof v === "string") deferred(v, c);
-			return {
-				type,
-				value: v
-			};
-	}
-}
-/** A group's `$type` in DTCG terms; undefined when it depends on each value (line heights). */
-const groupType = (sourceType) => {
-	const t = mapType(sourceType);
-	return t === "lineHeight" ? void 0 : t;
-};
 //#endregion
 //#region ../dsgraph-adapters/dist/tokens-json.js
 /** The `$extensions` key under which token-set files keep color modifiers (`modify`). */
 const MODIFIER_EXTENSION = "studio.tokens";
-const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const isObj$1 = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const base = (p) => p.slice(p.lastIndexOf("/") + 1);
 const dir = (p) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
 const META = /(^|\/)\$(themes|metadata)\.json$/;
@@ -18901,13 +22672,13 @@ const META = /(^|\/)\$(themes|metadata)\.json$/;
 function isLegacyToken(o) {
 	if (!Object.hasOwn(o, "value") || Object.hasOwn(o, "$value")) return false;
 	const v = o.value;
-	return "type" in o || !isObj(v) || !Object.values(v).every(isObj);
+	return "type" in o || !isObj$1(v) || !Object.values(v).every(isObj$1);
 }
 /** A token whose values per mode sit under `sets`: `{ "sets": { "light": { "value" }, "dark": … } }`. */
 function isSetToken(o) {
-	if (Object.hasOwn(o, "value") || Object.hasOwn(o, "$value") || !isObj(o.sets)) return false;
+	if (Object.hasOwn(o, "value") || Object.hasOwn(o, "$value") || !isObj$1(o.sets)) return false;
 	const sets = Object.values(o.sets);
-	return sets.length > 0 && sets.every((v) => isObj(v) && (Object.hasOwn(v, "value") || isSetToken(v)));
+	return sets.length > 0 && sets.every((v) => isObj$1(v) && (Object.hasOwn(v, "value") || isSetToken(v)));
 }
 const isToken = (o) => Object.hasOwn(o, "$value") || isLegacyToken(o) || isSetToken(o);
 /** A type named by the token's `$schema` link (`…/token-types/color.json`); aliases and sets have none. */
@@ -18936,7 +22707,7 @@ function fromSets(o) {
 	};
 	if (type) token.type = type;
 	token.$extensions = {
-		...isObj(o.$extensions) ? o.$extensions : {},
+		...isObj$1(o.$extensions) ? o.$extensions : {},
 		mode: Object.fromEntries(leaves.map(([m, l]) => [m, l.value]))
 	};
 	return token;
@@ -18950,7 +22721,7 @@ const newSurvey = () => ({
 	ids: /* @__PURE__ */ new Set()
 });
 function survey(node, s, inheritsType = false, path = []) {
-	if (!isObj(node)) return;
+	if (!isObj$1(node)) return;
 	const tree = isSetToken(node) ? fromSets(node) : node;
 	if (isToken(tree)) {
 		const dollar = Object.hasOwn(tree, "$value");
@@ -18969,7 +22740,7 @@ function survey(node, s, inheritsType = false, path = []) {
 	for (const [k, v] of Object.entries(tree)) if (!k.startsWith("$")) survey(v, s, inheritsType || groupType, [...path, k]);
 }
 /** JSON Schema documents describe tokens; they are not tokens. */
-const isJsonSchema = (tree) => isObj(tree) && (typeof tree.$schema === "string" && /json-schema\.org/.test(tree.$schema) || isObj(tree.properties) && ("type" in tree || "allOf" in tree || "$id" in tree));
+const isJsonSchema = (tree) => isObj$1(tree) && (typeof tree.$schema === "string" && /json-schema\.org/.test(tree.$schema) || isObj$1(tree.properties) && ("type" in tree || "allOf" in tree || "$id" in tree));
 async function readAll(source, config, diag) {
 	const exclude = excludeFor(config, "tokens");
 	const files = (await source.list(config.tokens?.include ?? ["**/*.json", "**/*.json5"])).filter((p) => /\.(json5?|tokens)$/i.test(p) && !matchGlob(p, exclude) && (META.test(p) || !NOT_TOKENS.test(p))).sort().slice(0, 2e3);
@@ -18991,7 +22762,7 @@ async function readAll(source, config, diag) {
 	}
 	return out;
 }
-const hasMarkers = (f) => META.test(f.file) || isObj(f.tree) && ("$themes" in f.tree || "$metadata" in f.tree);
+const hasMarkers = (f) => META.test(f.file) || isObj$1(f.tree) && ("$themes" in f.tree || "$metadata" in f.tree);
 /**
 * Which tool wrote these files, or undefined for typed DTCG (left to the core). DTCG syntax
 * without any `$type` is read like value/type JSON: types come from names and values.
@@ -19000,7 +22771,7 @@ function dialectOf(files) {
 	const s = newSurvey();
 	for (const f of files) survey(f.tree, s);
 	const tokenFiles = files.filter((f) => !hasMarkers(f));
-	const setsAtTop = tokenFiles.length === 1 && isObj(tokenFiles[0].tree) && topLevelAreSets(tokenFiles[0].tree);
+	const setsAtTop = tokenFiles.length === 1 && isObj$1(tokenFiles[0].tree) && topLevelAreSets(tokenFiles[0].tree);
 	if (files.some(hasMarkers) || s.setTypes > 0 || setsAtTop) return "token-sets";
 	if (s.legacy > 0) return "legacy-json";
 	if (s.dtcg > 0 && s.typed === 0) return "legacy-json";
@@ -19066,7 +22837,7 @@ const DTCG_PROPS = /* @__PURE__ */ new Set([
 ]);
 /** Converts a token tree to DTCG 2025.10. Group types are carried down to convert values. */
 function convertTree(tree, dialect, unit, path = [], type) {
-	if (!isObj(tree)) return tree;
+	if (!isObj$1(tree)) return tree;
 	const out = {};
 	const inherited = typeof tree.$type === "string" ? tree.$type : type;
 	for (const [k, v] of Object.entries(tree)) {
@@ -19077,7 +22848,7 @@ function convertTree(tree, dialect, unit, path = [], type) {
 			} else if (DTCG_PROPS.has(k)) out[k] = v;
 			continue;
 		}
-		if (!isObj(v)) continue;
+		if (!isObj$1(v)) continue;
 		const segs = splitName(k);
 		const at = [...path, ...segs];
 		place(out, segs, isToken(v) ? convertToken(v, at, dialect, unit, inherited) : convertTree(v, dialect, unit, at, inherited));
@@ -19094,17 +22865,17 @@ function splitName(key) {
 * (`color.bg` and `color.bg.hovered`); the token then becomes the group's `$root`.
 */
 function place(out, segs, value) {
-	const isTok = (v) => isObj(v) && "$value" in v;
+	const isTok = (v) => isObj$1(v) && "$value" in v;
 	let node = out;
 	for (const seg of segs.slice(0, -1)) {
 		const cur = node[seg];
 		if (isTok(cur)) node[seg] = { $root: cur };
-		else if (!isObj(cur)) node[seg] = {};
+		else if (!isObj$1(cur)) node[seg] = {};
 		node = node[seg];
 	}
 	const last = segs[segs.length - 1];
 	const prev = node[last];
-	if (!isObj(prev) || !isObj(value)) {
+	if (!isObj$1(prev) || !isObj$1(value)) {
 		node[last] = value;
 		return;
 	}
@@ -19146,17 +22917,17 @@ function convertToken(node, path, dialect, unit, inherited) {
 		token.$deprecated = deprecated === true && typeof comment === "string" ? comment : deprecated;
 	}
 	const ext = {
-		...isObj(node.extensions) ? node.extensions : {},
-		...isObj(node.$extensions) ? normalizeRefs(node.$extensions) : {}
+		...isObj$1(node.extensions) ? node.extensions : {},
+		...isObj$1(node.$extensions) ? normalizeRefs(node.$extensions) : {}
 	};
-	if (isObj(ext.mode)) ext.mode = Object.fromEntries(Object.entries(ext.mode).map(([m, v]) => [m, convertValue(type ?? sourceType, v, path, c).value]));
+	if (isObj$1(ext.mode)) ext.mode = Object.fromEntries(Object.entries(ext.mode).map(([m, v]) => [m, convertValue(type ?? sourceType, v, path, c).value]));
 	const dev = {};
 	if (inferred) dev.typeInferred = true;
 	if (c.expression) dev.expression = { unit };
 	if (sourceType && sourceType !== type) dev.sourceType = sourceType;
 	if (typeof node.uuid === "string" && node.uuid) dev.stableId = node.uuid;
 	const carrier = ext[MODIFIER_EXTENSION];
-	if (isObj(carrier) && isObj(carrier.modify) && typeof carrier.modify.type === "string") {
+	if (isObj$1(carrier) && isObj$1(carrier.modify) && typeof carrier.modify.type === "string") {
 		const m = carrier.modify;
 		dev.colorModifier = {
 			type: m.type,
@@ -19173,9 +22944,9 @@ function themesOf(raw, diag, file) {
 	if (!Array.isArray(raw)) return [];
 	const out = [];
 	for (const t of raw) {
-		if (!isObj(t) || typeof t.name !== "string") continue;
+		if (!isObj$1(t) || typeof t.name !== "string") continue;
 		const sets = /* @__PURE__ */ new Map();
-		if (isObj(t.selectedTokenSets)) {
+		if (isObj$1(t.selectedTokenSets)) {
 			for (const [k, v] of Object.entries(t.selectedTokenSets)) if (typeof v === "string") sets.set(k, v);
 		}
 		out.push({
@@ -19189,9 +22960,9 @@ function themesOf(raw, diag, file) {
 }
 /** Ids of tokens in a tree, prefixed by `prefix`. */
 function tokenIds(tree, prefix, out) {
-	if (!isObj(tree)) return;
+	if (!isObj$1(tree)) return;
 	for (const [k, v] of Object.entries(tree)) {
-		if (k.startsWith("$") || !isObj(v)) continue;
+		if (k.startsWith("$") || !isObj$1(v)) continue;
 		if (isToken(v)) out.add([...prefix, k].join("."));
 		else tokenIds(v, [...prefix, k], out);
 	}
@@ -19199,7 +22970,7 @@ function tokenIds(tree, prefix, out) {
 function refsIn(v, out) {
 	if (typeof v === "string") for (const m of v.matchAll(/\{([^{}]+)\}/g)) out.push(m[1].replace(/\.\$?value$/, ""));
 	else if (Array.isArray(v)) for (const x of v) refsIn(x, out);
-	else if (isObj(v)) for (const x of Object.values(v)) refsIn(x, out);
+	else if (isObj$1(v)) for (const x of Object.values(v)) refsIn(x, out);
 }
 /**
 * A single exported token-set file keeps its sets as top-level keys; references then leave the set
@@ -19225,15 +22996,15 @@ function setsSystem(files, diag) {
 	const metaFile = files.find((f) => base(f.file) === "$metadata.json");
 	const themesFile = files.find((f) => base(f.file) === "$themes.json");
 	const root = dir((metaFile ?? themesFile)?.file ?? "");
-	if (metaFile && isObj(metaFile.tree) && Array.isArray(metaFile.tree.tokenSetOrder)) order = metaFile.tree.tokenSetOrder.filter((s) => typeof s === "string");
+	if (metaFile && isObj$1(metaFile.tree) && Array.isArray(metaFile.tree.tokenSetOrder)) order = metaFile.tree.tokenSetOrder.filter((s) => typeof s === "string");
 	if (themesFile) themes = themesOf(themesFile.tree, diag, themesFile.file);
 	const single = files.filter((f) => !META.test(f.file)).length === 1;
 	for (const f of files) {
-		if (META.test(f.file) || !isObj(f.tree)) continue;
-		if (isObj(f.tree.$metadata) && Array.isArray(f.tree.$metadata.tokenSetOrder)) order ??= f.tree.$metadata.tokenSetOrder.filter((s) => typeof s === "string");
+		if (META.test(f.file) || !isObj$1(f.tree)) continue;
+		if (isObj$1(f.tree.$metadata) && Array.isArray(f.tree.$metadata.tokenSetOrder)) order ??= f.tree.$metadata.tokenSetOrder.filter((s) => typeof s === "string");
 		if (f.tree.$themes) themes = themes.length ? themes : themesOf(f.tree.$themes, diag, f.file);
 		if ("$themes" in f.tree || "$metadata" in f.tree || single && topLevelAreSets(f.tree)) {
-			for (const [name, tree] of Object.entries(f.tree)) if (!name.startsWith("$") && isObj(tree)) sets.set(name, {
+			for (const [name, tree] of Object.entries(f.tree)) if (!name.startsWith("$") && isObj$1(tree)) sets.set(name, {
 				file: `${f.file}#/${name}`,
 				tree: convertTree(tree, "token-sets", unit)
 			});
@@ -19322,6 +23093,990 @@ const jsonTokens = {
 			}],
 			synthetic: true,
 			kind: "legacy-json"
+		};
+	}
+};
+//#endregion
+//#region ../dsgraph-report/dist/values.js
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const plain = (value) => typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value);
+/**
+* Short human-readable form of a canonical value. Never throws: a value that does not have the
+* shape of its type (a source error) is shown as it is.
+*/
+function formatValue(type, value) {
+	try {
+		return formatTyped(type, value);
+	} catch {
+		return plain(value);
+	}
+}
+function formatTyped(type, value) {
+	if (value === null || value === void 0) return "—";
+	switch (type) {
+		case "color": {
+			if (!isObj(value) || !Array.isArray(value.components)) return plain(value);
+			const c = value;
+			const hex = colorToHex(c);
+			const alpha = c.alpha < 1 ? ` ${Math.round(c.alpha * 100)}%` : "";
+			return c.space === "srgb" ? `${hex}${alpha}` : `${hex}${alpha} (${c.space})`;
+		}
+		case "dimension":
+		case "duration": {
+			const d = value;
+			return `${d.value}${d.unit}`;
+		}
+		case "fontFamily": return value.join(", ");
+		case "cubicBezier": return `cubic-bezier(${value.join(", ")})`;
+		case "shadow": return value.map((l) => [
+			l.inset ? "inset" : "",
+			...[
+				"offsetX",
+				"offsetY",
+				"blur",
+				"spread"
+			].map((k) => formatValue("dimension", l[k])),
+			formatValue("color", l.color)
+		].filter(Boolean).join(" ")).join(", ");
+		case "border": {
+			const b = value;
+			return `${formatValue("dimension", b.width)} ${typeof b.style === "string" ? b.style : "dashed"} ${formatValue("color", b.color)}`;
+		}
+		case "typography": {
+			const t = value;
+			return `${formatValue("fontWeight", t.fontWeight)} ${formatValue("dimension", t.fontSize)}/${t.lineHeight ?? "—"} ${formatValue("fontFamily", t.fontFamily)}`;
+		}
+		default: return plain(value);
+	}
+}
+/** Value of a changeset side (`{ raw, value }`) with the alias it came from, if any. */
+function formatSide(type, side) {
+	if (!isObj(side)) return formatValue(type, side);
+	return `${formatValue(type, side.value)}${typeof side.raw === "string" && /^\{[^{}]+\}$/.test(side.raw) ? ` ← ${side.raw}` : ""}`;
+}
+function formatDelta(delta) {
+	if (!delta) return "";
+	const parts = [];
+	if (typeof delta.deltaEOK === "number") parts.push(`ΔE ${delta.deltaEOK}`);
+	if (typeof delta.deltaAlpha === "number") parts.push(`α ${delta.deltaAlpha > 0 ? "+" : ""}${delta.deltaAlpha}`);
+	if (typeof delta.px === "number") parts.push(`${delta.px > 0 ? "+" : ""}${delta.px}px`);
+	if (typeof delta.ms === "number") parts.push(`${delta.ms > 0 ? "+" : ""}${delta.ms}ms`);
+	if (typeof delta.by === "number") parts.push(`${delta.by > 0 ? "+" : ""}${delta.by}`);
+	if (Array.isArray(delta.fields)) parts.push(`changed: ${delta.fields.join(", ")}`);
+	for (const [k, one] of [["layers", "layer"], ["stops", "stop"]]) {
+		const d = delta[k];
+		if (Array.isArray(d)) parts.push(`${d.length === 1 ? one : k} ${d.map((i) => Number(i) + 1).join(", ")}`);
+		else if (d !== void 0) parts.push(`${k}: ${String(d)}`);
+	}
+	if (delta.unit !== void 0) parts.push(`unit: ${String(delta.unit)}`);
+	return parts.join(", ");
+}
+function formatSource(s) {
+	if (s.kind === "npm") return `npm:${s.package}@${s.version}`;
+	if (s.kind === "github") return `github:${s.repo}@${s.ref}${s.commit ? ` (${s.commit.slice(0, 7)})` : ""}${s.path ? `/${s.path}` : ""}`;
+	if (s.path) return s.path;
+	return s.kind;
+}
+const formatWhen = (when) => when && Object.keys(when).length > 0 ? ` (${Object.entries(when).map(([k, v]) => `${k}: ${v}`).join(", ")})` : "";
+//#endregion
+//#region ../dsgraph-report/dist/changeset.js
+const LEVEL_TITLE = {
+	major: "Breaking (major)",
+	minor: "Minor",
+	patch: "Patch",
+	none: "No impact"
+};
+const typeOf = (c) => {
+	const side = c.after ?? c.before;
+	if (side && typeof side === "object" && "type" in side) return side.type ?? null;
+	return null;
+};
+/** One line describing a change; `type` comes from the head token when known. */
+function describe(c, types, code) {
+	const t = types.get(c.target) ?? typeOf(c);
+	const where = formatWhen(c.when);
+	switch (c.kind) {
+		case "token.added": return `added ${code(c.target)}`;
+		case "token.removed": {
+			const maybe = c.possibleRenames?.length ? ` — possibly renamed to ${c.possibleRenames.map(code).join(" or ")}` : "";
+			return `removed ${code(c.target)}${maybe}`;
+		}
+		case "token.renamed": return `renamed ${code(c.from ?? "?")} → ${code(c.target)}${c.confidence < .8 ? ` (likely, ${Math.round(c.confidence * 100)}%)` : ""}`;
+		case "token.value-changed": {
+			const delta = formatDelta(c.delta);
+			return `${code(c.target)}${where}: ${formatSide(t, c.before)} → ${formatSide(t, c.after)}${delta ? ` (${delta})` : ""}`;
+		}
+		case "token.notation-changed": return `${code(c.target)}${where}: same value, written differently`;
+		case "token.alias-retargeted": return `${code(c.target)}${where}: now ${formatSide(t, c.after)}, same value`;
+		case "token.type-changed": return `${code(c.target)}: type ${String(c.before)} → ${String(c.after)}`;
+		case "token.missing-in-context": return `${code(c.target)} is no longer defined${where}`;
+		case "token.contexts-changed": return `${code(c.target)}: depends on ${JSON.stringify(c.before)} → ${JSON.stringify(c.after)}`;
+		case "token.deprecated": {
+			const d = c.after;
+			return `deprecated ${code(c.target)}${d?.replacement ? ` — use ${code(d.replacement)}` : d?.reason ? ` — ${d.reason}` : ""}`;
+		}
+		case "token.undeprecated": return `no longer deprecated ${code(c.target)}`;
+		case "token.description-changed": return `${code(c.target)}: description changed`;
+		case "token.extensions-changed": return `${code(c.target)}: $extensions changed`;
+		case "group.extends-changed": return `group ${code(c.target)}: $extends ${String(c.before ?? "—")} → ${String(c.after ?? "—")}`;
+		case "context.added":
+		case "context.removed": return `${c.kind === "context.added" ? "added" : "removed"} context ${code(c.target)}`;
+		case "modifier.added":
+		case "modifier.removed": return `${c.kind === "modifier.added" ? "added" : "removed"} modifier ${code(c.target)}`;
+		default: return `${c.kind} ${code(c.target)}`;
+	}
+}
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+/** `src/button.css:12, src/card.scss:4 and 3 more` */
+function sitesLine(ci, max, code) {
+	const listed = ci.sites.slice(0, max).map((s) => code(`${s.file}:${s.line}`));
+	const more = ci.sites.length > max ? ` and ${ci.sites.length - max} more` : "";
+	return `${ci.effect === "breaks" ? "breaks" : "changes"} ${plural(ci.sites.length, "place")} in the code: ${listed.join(", ")}${more}`;
+}
+/** Formats a changeset. Propagated value changes are listed under the direct change that caused them. */
+function formatChangeset(cs, opts = {}) {
+	const format = opts.format ?? "text";
+	if (format === "json") return `${JSON.stringify(opts.impact ? {
+		...cs,
+		impact: opts.impact
+	} : cs, null, 2)}\n`;
+	const md = format === "markdown";
+	const code = (s) => md ? `\`${s}\`` : s;
+	const types = opts.types ?? /* @__PURE__ */ new Map();
+	const max = opts.maxPropagated ?? 5;
+	const maxSites = opts.maxSites ?? 5;
+	const impactBy = new Map((opts.impact?.changes ?? []).map((ci) => [ci.change, ci]));
+	const propagatedBy = /* @__PURE__ */ new Map();
+	for (const c of cs.changes) for (const cause of c.cause) propagatedBy.set(cause, [...propagatedBy.get(cause) ?? [], c]);
+	const shown = cs.changes.filter((c) => !(c.origin === "propagated" && c.cause.length > 0));
+	const counts = cs.summary.counts;
+	const summary = [
+		counts.removed ? `${counts.removed} removed` : "",
+		counts.renamed ? `${counts.renamed} renamed` : "",
+		counts.changed ? `${counts.changed} changed${counts.propagated ? ` (+${counts.propagated} through references)` : ""}` : "",
+		counts.added ? `${counts.added} added` : "",
+		counts.deprecated ? `${counts.deprecated} deprecated` : ""
+	].filter(Boolean);
+	const lines = [];
+	const title = cs.changes.length === 0 ? "no changes" : `suggested bump: ${cs.summary.level}`;
+	if (md) {
+		lines.push(`## dsgraph diff — ${title}`, "");
+		lines.push(`${formatSource(cs.base.source)} → ${formatSource(cs.head.source)}`, "");
+		if (summary.length) lines.push(`**${summary.join(" · ")}**`, "");
+		if (opts.impact) lines.push(impactSummary(opts.impact), "");
+	} else {
+		lines.push(`dsgraph diff — ${title}`, `${formatSource(cs.base.source)} → ${formatSource(cs.head.source)}`);
+		if (summary.length) lines.push(summary.join(" · "));
+		if (opts.impact) lines.push(impactSummary(opts.impact));
+		lines.push("");
+	}
+	for (const level of [
+		"major",
+		"minor",
+		"patch",
+		"none"
+	]) {
+		const group = shown.filter((c) => c.level === level);
+		if (group.length === 0) continue;
+		const collapsible = md && (level === "patch" || level === "none");
+		if (collapsible) lines.push(`<details><summary>${LEVEL_TITLE[level]} (${group.length})</summary>`, "");
+		else lines.push(md ? `### ${LEVEL_TITLE[level]} (${group.length})` : `${LEVEL_TITLE[level]} (${group.length})`, "");
+		for (const c of group) {
+			lines.push(`${md ? "- " : "  "}${describe(c, types, code)}`);
+			const via = propagatedBy.get(c.id);
+			if (via?.length) {
+				const names = [...new Set(via.map((p) => p.target))];
+				const listed = names.slice(0, max).map(code).join(", ");
+				lines.push(`${md ? "  - " : "      "}affects ${listed}${names.length > max ? ` and ${names.length - max} more` : ""}`);
+			}
+			const ci = impactBy.get(c.id);
+			if (ci) lines.push(`${md ? "  - " : "      "}${sitesLine(ci, maxSites, code)}`);
+		}
+		lines.push("");
+		if (collapsible) lines.push("</details>", "");
+	}
+	if (cs.contexts.partial) lines.push(md ? "> Some contexts were not fully compared (too many permutations)." : "Note: some contexts were not fully compared.", "");
+	return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
+}
+function impactSummary(impact) {
+	if (impact.breaks === 0 && impact.looksDifferent === 0) return "In the code: nothing uses the changed tokens.";
+	return `In the code: ${[impact.breaks ? `${plural(impact.breaks, "place")} ${impact.breaks === 1 ? "breaks" : "break"}` : "", impact.looksDifferent ? `${plural(impact.looksDifferent, "place")} ${impact.looksDifferent === 1 ? "looks" : "look"} different` : ""].filter(Boolean).join(", ")} (${plural(impact.files.length, "file")}).`;
+}
+//#endregion
+//#region ../dsgraph-report/dist/findings.js
+const ICON = {
+	error: "✖",
+	warning: "▲",
+	info: "•"
+};
+/** Findings of one rule whose messages differ only in quoted values (`Color "…" is a string`). */
+/** `file:line` when a finding points into code, the file alone otherwise. */
+const where = (loc) => `${loc.file}${loc.line ? `:${loc.line}` : ""}`;
+const QUOTED = /"[^"]*"/g;
+/** What differs between repeated messages: quoted values and numbers (`steps 0 and 1`). */
+const VARIABLE = /"[^"]*"|\b\d+(?:\.\d+)?\b/g;
+const mask = (part) => part.startsWith("\"") ? "\"…\"" : "…";
+/** Groups repeated findings: same rule, same severity, same message up to quoted values and numbers. Order is kept. */
+function groupFindings(findings) {
+	const groups = /* @__PURE__ */ new Map();
+	for (const f of findings) {
+		const pattern = f.message.replace(VARIABLE, mask);
+		const key = `${f.severity}\u0000${f.rule}\u0000${pattern}`;
+		const g = groups.get(key);
+		if (g) g.findings.push(f);
+		else groups.set(key, {
+			rule: f.rule,
+			severity: f.severity,
+			pattern,
+			findings: [f]
+		});
+	}
+	for (const g of groups.values()) {
+		g.pattern = restoreShared(g.findings.map((f) => f.message));
+		const files = new Set(g.findings.map((f) => f.loc?.file));
+		const [file] = files;
+		if (files.size === 1 && file) g.file = file;
+	}
+	return [...groups.values()];
+}
+/** Masks only the values that differ between messages; a shared one stays (`use "px"`, `2025.10`). */
+function restoreShared(messages) {
+	const parts = messages.map((m) => m.match(VARIABLE) ?? []);
+	let i = 0;
+	return messages[0].replace(VARIABLE, (q) => {
+		const k = i++;
+		return parts.every((ps) => ps[k] === q) ? q : mask(q);
+	});
+}
+/** What tells one finding of a group from another: its token, else the quoted values of its message. */
+function findingLabel(f) {
+	return `${f.nodes[0] ?? f.message.match(QUOTED)?.join(" ") ?? f.message}${formatWhen(f.when)}`;
+}
+const summaryOf = (findings) => {
+	const counts = {
+		error: 0,
+		warning: 0,
+		info: 0
+	};
+	for (const f of findings) counts[f.severity]++;
+	return `${counts.error} errors · ${counts.warning} warnings · ${counts.info} info`;
+};
+const cell = (s) => s.replace(/\|/g, "\\|");
+function formatFindings(findings, opts = {}) {
+	const format = opts.format ?? "text";
+	if (format === "json") return `${JSON.stringify(findings, null, 2)}\n`;
+	const grouped = opts.group ?? true;
+	const md = format === "markdown";
+	if (findings.length === 0) return md ? "## dsgraph check — no findings\n" : "dsgraph check — no findings\n";
+	const summary = summaryOf(findings);
+	const head = opts.heading === false ? "" : `## dsgraph check — ${summary}\n\n`;
+	if (md) {
+		if (!grouped) return `${head}| | Rule | Finding | File |\n|---|---|---|---|\n${findings.map((f) => `| ${ICON[f.severity]} ${f.severity} | \`${f.rule}\` | ${cell(f.message)}${formatWhen(f.when)} | ${f.loc?.file ? `\`${where(f.loc)}\`` : ""} |`).join("\n")}\n`;
+		const groups = groupFindings(findings);
+		const max = opts.maxListed ?? 50;
+		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(g.pattern)}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.findings.length === 1 && g.findings[0].loc?.file ? `\`${where(g.findings[0].loc)}\`` : g.file ? `\`${g.file}\`` : ""} |`);
+		const details = groups.filter((g) => g.findings.length > 1).map((g) => {
+			const items = g.findings.slice(0, max).map((f) => `- ${cell(f.message)}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : ""}`);
+			if (g.findings.length > max) items.push(`- … and ${g.findings.length - max} more`);
+			return `<details><summary>${ICON[g.severity]} <code>${g.rule}</code> — ${g.findings.length} × ${escapeHtml(g.pattern)}</summary>\n\n${items.join("\n")}\n\n</details>`;
+		});
+		return `${head}| | Rule | Count | Finding | File |\n|---|---|---|---|---|\n${rows.join("\n")}\n${details.length ? `\n${details.join("\n\n")}\n` : ""}`;
+	}
+	const line = (severity, rule, text) => `${ICON[severity]} ${severity.padEnd(7)} ${rule.padEnd(30)} ${text}`;
+	if (!grouped) return `dsgraph check — ${summary}\n\n${findings.map((f) => line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${where(f.loc)})` : ""}`)).join("\n")}\n`;
+	const examples = opts.examples ?? 3;
+	const indent = " ".repeat(41);
+	const lines = [];
+	for (const g of groupFindings(findings)) {
+		const n = g.findings.length;
+		const file = g.file ? `  (${g.file})` : "";
+		if (n === 1) {
+			const f = g.findings[0];
+			lines.push(line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${where(f.loc)})` : ""}`));
+			continue;
+		}
+		lines.push(line(g.severity, g.rule, `${n}× ${g.pattern}${file}`));
+		const labels = g.findings.slice(0, examples).map(findingLabel);
+		lines.push(`${indent}${labels.join(", ")}${n > examples ? `, … and ${n - examples} more` : ""}`);
+	}
+	return `dsgraph check — ${summary}\n\n${lines.join("\n")}\n`;
+}
+const escapeHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+//#endregion
+//#region ../dsgraph-rules/dist/presets.js
+/** Presets follow architecture patterns only — never specific design systems (neutrality principle). */
+const PRESETS = {
+	/** Sensible defaults; equal to the rules' default severities. */
+	recommended: {
+		"token/deprecated-reference": "warning",
+		"naming/normalized-collision": "warning",
+		"color/hex-mismatch": "warning",
+		"color/out-of-gamut": "info",
+		"palette/non-monotonic": "warning",
+		"palette/duplicate-stops": "warning"
+	},
+	/** Only what DTCG 2025.10 requires: legacy syntax and non-standard values become errors. */
+	"dtcg-strict": {
+		"dtcg/legacy-syntax": "error",
+		"dtcg/invalid-unit": "error",
+		"dtcg/invalid-font-weight": "error",
+		"dtcg/unknown-type": "error",
+		"dtcg/typography-missing-field": "error",
+		"tokens/non-json": "error"
+	},
+	/** Two layers: `core` holds raw values and aliases nothing; `semantic` references `core` directly. */
+	"two-layer": {
+		"layer/allowed-sources": ["warning", { allow: {
+			core: [],
+			semantic: ["core", "semantic"]
+		} }],
+		"layer/alias-depth": ["warning", {
+			layer: "semantic",
+			max: 0
+		}]
+	}
+};
+//#endregion
+//#region ../dsgraph-rules/dist/rules/code.js
+const asArray$1 = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+/** `exceptions: { files: ["src/legacy/**"], values: ["#000", "100%"] }` */
+function excepted(options) {
+	const ex = options.exceptions ?? {};
+	const files = asArray$1(ex.files);
+	const values = new Set(asArray$1(ex.values).map((v) => v.toLowerCase()));
+	return (l) => files.length > 0 && matchGlob(l.file, files) || l.text !== void 0 && values.has(l.text.toLowerCase());
+}
+const locOf = (l) => ({
+	file: l.file,
+	line: l.line,
+	column: l.column
+});
+/**
+* Which scale a property takes values from, by token names. Spacing falls back to every dimension
+* when names say nothing; radii and font sizes are not compared with spacing.
+*/
+const FAMILIES = [
+	{
+		property: /radius$/i,
+		names: /(^|\.)(radius|radii|rounded|corner|round)(\.|$)/,
+		strict: true
+	},
+	{
+		property: /^font-size$/i,
+		names: /(^|\.)(font|text|type|typography)(\.|$)/,
+		strict: true
+	},
+	{
+		property: /.*/,
+		names: /(^|\.)(space|spacing|spacer|gap|gutter|inset|size|sizing|stack|layout)(\.|$)/,
+		strict: false
+	}
+];
+function scaleOf(graph, property, cache) {
+	const family = FAMILIES.find((f) => f.property.test(property));
+	let tokens = cache.get(family.names);
+	if (!tokens) {
+		const all = graph.tokens({ type: "dimension" });
+		const named = all.filter((t) => family.names.test(normalizeName(t.id)));
+		tokens = named.length || family.strict ? named : all;
+		cache.set(family.names, tokens);
+	}
+	return tokens;
+}
+function nearestIn(graph, l, among) {
+	const all = nearestTokens(graph, {
+		type: l.type,
+		value: l.value
+	}, graph.defaultInput(), among ? 1e4 : 1);
+	return among ? all.find((m) => among.has(m.token.id)) : all[0];
+}
+const hardcodedColor = {
+	id: "style/hardcoded-color",
+	description: "A color in a style is written by hand instead of taken from a token.",
+	defaultSeverity: "warning",
+	run({ graph, code, options, report }) {
+		if (!code || graph.tokens({ type: "color" }).length === 0) return;
+		const skip = excepted(options);
+		const memo = /* @__PURE__ */ new Map();
+		for (const l of code.literals) {
+			if (l.type !== "color" || skip(l)) continue;
+			const key = l.text.toLowerCase();
+			if (!memo.has(key)) memo.set(key, nearestIn(graph, l));
+			const near = memo.get(key);
+			if (!near) continue;
+			report({
+				message: near.exact ? `Color "${l.text}" in ${l.property} is written by hand; use "${near.token.id}"` : `Color "${l.text}" in ${l.property} is not in the palette; closest is "${near.token.id}" (ΔE ${near.distance})`,
+				nodes: [near.token.id],
+				evidence: {
+					value: l.text,
+					property: l.property,
+					selector: l.selector,
+					token: near.token.id,
+					deltaE: near.distance
+				},
+				loc: locOf(l)
+			});
+		}
+	}
+};
+const offScale = {
+	id: "style/off-scale",
+	description: "A spacing, radius or font size in a style is written by hand: on the scale (use the token) or off it.",
+	defaultSeverity: "warning",
+	run({ graph, code, options, report }) {
+		if (!code || graph.tokens({ type: "dimension" }).length === 0) return;
+		const skip = excepted(options);
+		const scales = /* @__PURE__ */ new Map();
+		for (const l of code.literals) {
+			if (l.type !== "dimension" || skip(l)) continue;
+			const scale = scaleOf(graph, l.property, scales);
+			const near = nearestIn(graph, l, new Set(scale.map((t) => t.id)));
+			if (!near) continue;
+			const px = near.value;
+			report({
+				message: near.exact ? `"${l.text}" in ${l.property} is on the scale; use "${near.token.id}"` : `"${l.text}" in ${l.property} is off the scale; closest is "${near.token.id}" (${px.value}${px.unit})`,
+				nodes: [near.token.id],
+				evidence: {
+					value: l.text,
+					property: l.property,
+					selector: l.selector,
+					token: near.token.id,
+					distance: near.distance
+				},
+				loc: locOf(l),
+				...near.exact ? { severity: "info" } : {}
+			});
+		}
+	}
+};
+const deprecatedUsage = {
+	id: "usage/deprecated",
+	description: "The code uses a deprecated token.",
+	defaultSeverity: "warning",
+	run({ code, vars, options, report }) {
+		if (!code || !vars) return;
+		const skip = excepted(options);
+		for (const u of code.uses) {
+			if (skip(u)) continue;
+			const t = vars.token(u.name);
+			if (!t?.deprecated) continue;
+			const replacement = t.deprecated.replacement;
+			report({
+				message: `"${u.name}" is deprecated${replacement ? `; use "${replacement}"` : ""}`,
+				nodes: [t.id],
+				evidence: {
+					reason: t.deprecated.reason,
+					replacement,
+					property: u.property
+				},
+				loc: locOf(u)
+			});
+		}
+	}
+};
+const unknownToken = {
+	id: "usage/unknown-token",
+	description: "The code uses a design-system variable that is not in the tokens (removed, renamed or misspelled). Needs the system's prefix, configured or learned.",
+	defaultSeverity: "error",
+	run({ code, vars, options, report }) {
+		if (!code || !vars) return;
+		const skip = excepted(options);
+		for (const u of code.uses) {
+			if (skip(u) || !vars.isSystemName(u.name) || vars.token(u.name)) continue;
+			report({
+				message: `"${u.name}" is not a token${u.fallback ? `; the fallback "${u.fallback}" is used instead` : ""}`,
+				nodes: [],
+				evidence: {
+					property: u.property,
+					fallback: u.fallback
+				},
+				loc: locOf(u)
+			});
+		}
+	}
+};
+/** Tokens the code reads, with everything they take their values from. */
+function usedTokens(ctx) {
+	const used = /* @__PURE__ */ new Set();
+	for (const u of ctx.code?.uses ?? []) {
+		const t = ctx.vars?.token(u.name);
+		if (!t || used.has(t.id)) continue;
+		used.add(t.id);
+		for (const d of ctx.graph.dependencies(t.id, { transitive: true })) used.add(d);
+	}
+	return used;
+}
+const unusedToken = {
+	id: "token/unused",
+	description: "A token is not used by the code, directly or through another token.",
+	defaultSeverity: "info",
+	run(ctx) {
+		const { graph, code, report } = ctx;
+		if (!code || code.uses.length === 0) return;
+		const used = usedTokens(ctx);
+		for (const t of graph.tokens()) {
+			if (used.has(t.id) || t.deprecated) continue;
+			report({
+				message: `"${t.id}" is not used in the code`,
+				nodes: [t.id],
+				token: t
+			});
+		}
+	}
+};
+//#endregion
+//#region ../dsgraph-rules/dist/rules/layers.js
+/** Whole-value alias targets of a token across all its contexts. */
+function wholeTargets(graph, id) {
+	const t = graph.token(id);
+	if (!t) return [];
+	return [...new Set(t.values.flatMap((v) => v.refs.filter((r) => !r.property && !r.targetPath).map((r) => r.to)))];
+}
+const aliasDepth = {
+	id: "layer/alias-depth",
+	description: "Tokens of a layer reference tokens of the same layer deeper than allowed.",
+	defaultSeverity: "off",
+	run({ graph, options, report }) {
+		const layer = typeof options.layer === "string" ? options.layer : "semantic";
+		const max = typeof options.max === "number" ? options.max : 0;
+		const allow = (Array.isArray(options.allow) ? options.allow : []).filter((a) => typeof a === "string").map((a) => a.split("->").map((s) => s.trim()));
+		const allowed = (from, to) => allow.some(([f, t]) => matchPath(from, f) && matchPath(to, t));
+		const memo = /* @__PURE__ */ new Map();
+		const depth = (id, seen) => {
+			if (memo.has(id)) return memo.get(id);
+			let d = 0;
+			for (const to of wholeTargets(graph, id)) {
+				if (graph.token(to)?.layer !== layer || seen.has(to) || allowed(id, to)) continue;
+				d = Math.max(d, 1 + depth(to, /* @__PURE__ */ new Set([...seen, to])));
+			}
+			memo.set(id, d);
+			return d;
+		};
+		for (const t of graph.tokens({ layer })) {
+			const d = depth(t.id, /* @__PURE__ */ new Set([t.id]));
+			if (d > max) report({
+				message: `"${t.id}" goes through ${d} ${layer} alias${d > 1 ? "es" : ""} (max ${max})`,
+				nodes: [t.id, ...wholeTargets(graph, t.id)],
+				evidence: {
+					depth: d,
+					max,
+					chain: graph.chain(t.id)
+				},
+				token: t
+			});
+		}
+	}
+};
+const allowedSources = {
+	id: "layer/allowed-sources",
+	description: "Tokens of a layer reference only the layers allowed for it.",
+	defaultSeverity: "off",
+	run({ graph, options, report }) {
+		const allow = options.allow ?? {};
+		for (const [, from, to] of graph.edges("aliases")) {
+			const source = graph.token(from);
+			const target = graph.token(to);
+			const fromLayer = source?.layer;
+			if (!source || !target || !fromLayer || !(fromLayer in allow)) continue;
+			const permitted = Array.isArray(allow[fromLayer]) ? allow[fromLayer] : [];
+			if (!permitted.includes(target.layer ?? "")) report({
+				message: `"${from}" (${fromLayer}) references "${to}" (${target.layer ?? "no layer"}); ${fromLayer} may reference ${permitted.length ? permitted.join(", ") : "nothing"}`,
+				nodes: [from, to],
+				evidence: {
+					fromLayer,
+					toLayer: target.layer,
+					allowed: permitted
+				},
+				token: source
+			});
+		}
+	}
+};
+//#endregion
+//#region ../dsgraph-rules/dist/color.js
+const toRgb = converter("rgb");
+/** sRGB channels (0–1, clamped) and alpha of a canonical color value. */
+function rgba(c) {
+	const rgb = toRgb(toCulori(c));
+	const clamp = (v) => Math.min(1, Math.max(0, v ?? 0));
+	return [
+		clamp(rgb.r),
+		clamp(rgb.g),
+		clamp(rgb.b),
+		c.alpha
+	];
+}
+/** Composites `top` over an opaque `bottom`. */
+function over(top, bottom) {
+	return [
+		0,
+		1,
+		2
+	].map((i) => top[i] * top[3] + bottom[i] * (1 - top[3]));
+}
+function luminance([r, g, b]) {
+	const lin = (v) => v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4;
+	return .2126 * lin(r) + .7152 * lin(g) + .0722 * lin(b);
+}
+/** WCAG 2.x contrast ratio of text over a surface; translucent surfaces sit on white. */
+function contrastRatio(text, surface) {
+	const bg = over(rgba(surface), [
+		1,
+		1,
+		1
+	]);
+	const [l1, l2] = [luminance(over(rgba(text), bg)), luminance(bg)].sort((a, b) => b - a);
+	return (l1 + .05) / (l2 + .05);
+}
+//#endregion
+//#region ../dsgraph-rules/dist/rules/tokens.js
+const asArray = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+const deprecatedReference = {
+	id: "token/deprecated-reference",
+	description: "A token references a deprecated token.",
+	defaultSeverity: "warning",
+	run({ graph, report }) {
+		for (const [, from, to] of graph.edges("aliases")) {
+			const source = graph.token(from);
+			const target = graph.token(to);
+			if (!source || !target?.deprecated || source.deprecated) continue;
+			const replacement = target.deprecated.replacement;
+			report({
+				message: `"${from}" references deprecated "${to}"${replacement ? `; use "${replacement}"` : ""}`,
+				nodes: [from, to],
+				evidence: {
+					reason: target.deprecated.reason,
+					replacement
+				},
+				token: source
+			});
+		}
+	}
+};
+const normalizedCollision = {
+	id: "naming/normalized-collision",
+	description: "Different tokens map to the same name in code (CSS, Figma) after normalization.",
+	defaultSeverity: "warning",
+	run({ graph, report }) {
+		const byName = /* @__PURE__ */ new Map();
+		for (const t of graph.tokens()) {
+			const n = normalizeName(t.id);
+			byName.set(n, [...byName.get(n) ?? [], t.id]);
+		}
+		for (const [name, ids] of byName) if (ids.length > 1) report({
+			message: `${ids.map((i) => `"${i}"`).join(", ")} all normalize to "${name}"`,
+			nodes: ids,
+			evidence: { name }
+		});
+	}
+};
+const hexMismatch = {
+	id: "color/hex-mismatch",
+	description: "The hex fallback of a color does not match its components.",
+	defaultSeverity: "warning",
+	run({ graph, report }) {
+		for (const t of graph.tokens({ type: "color" })) for (const v of t.values) {
+			const c = v.value;
+			if (!c?.hex) continue;
+			const actual = colorToHex(c);
+			if ([
+				1,
+				3,
+				5
+			].some((i) => Math.abs(Number.parseInt(actual.slice(i, i + 2), 16) - Number.parseInt(c.hex.slice(i, i + 2), 16)) > 1)) report({
+				message: `"${t.id}": hex ${c.hex} does not match the color (${actual})`,
+				nodes: [t.id],
+				evidence: {
+					hex: c.hex,
+					computed: actual
+				},
+				when: v.when,
+				token: t
+			});
+		}
+	}
+};
+const outOfGamut = {
+	id: "color/out-of-gamut",
+	description: "A wide-gamut color is outside sRGB and has no hex fallback.",
+	defaultSeverity: "info",
+	run({ graph, report }) {
+		for (const t of graph.tokens({ type: "color" })) for (const v of t.values) {
+			const c = v.value;
+			if (c && !c.hex && !isInSrgbGamut(c)) report({
+				message: `"${t.id}" is outside sRGB; add a hex fallback for sRGB targets`,
+				nodes: [t.id],
+				evidence: { space: c.space },
+				when: v.when,
+				token: t
+			});
+		}
+	}
+};
+/** Color ramps: siblings whose last name segment is a number (`blue.100`, `blue-500`), at least 3 stops. */
+function ramps(graph) {
+	const groups = /* @__PURE__ */ new Map();
+	for (const t of graph.tokens({ type: "color" })) {
+		const segs = normalizeName(t.id).split(".");
+		const step = Number(segs.at(-1));
+		if (segs.length < 2 || !/^\d+$/.test(segs.at(-1)) || !Number.isFinite(step)) continue;
+		const key = segs.slice(0, -1).join(".");
+		groups.set(key, [...groups.get(key) ?? [], {
+			id: t.id,
+			step
+		}]);
+	}
+	return [...groups].filter(([, stops]) => stops.length >= 3).map(([name, stops]) => ({
+		name,
+		stops: stops.sort((a, b) => a.step - b.step)
+	}));
+}
+//#endregion
+//#region ../dsgraph-rules/dist/check.js
+const RULES = [
+	deprecatedReference,
+	normalizedCollision,
+	hexMismatch,
+	outOfGamut,
+	{
+		id: "palette/non-monotonic",
+		description: "Lightness of a numeric color ramp does not change in one direction.",
+		defaultSeverity: "warning",
+		run({ graph, report }) {
+			for (const { name, stops } of ramps(graph)) {
+				const l = stops.map((s) => {
+					const v = graph.value(s.id);
+					return v ? toOklab(v)[0] : NaN;
+				});
+				const dir = Math.sign(l.at(-1) - l[0]);
+				for (let i = 1; i < stops.length; i++) {
+					const step = l[i] - l[i - 1];
+					if (Number.isNaN(step) || Math.abs(step) < 1e-4) continue;
+					if (Math.sign(step) !== dir) report({
+						message: `Ramp "${name}": lightness goes the wrong way from ${stops[i - 1].step} to ${stops[i].step}`,
+						nodes: [stops[i - 1].id, stops[i].id],
+						evidence: {
+							ramp: name,
+							from: Math.round(l[i - 1] * 1e3) / 1e3,
+							to: Math.round(l[i] * 1e3) / 1e3
+						}
+					});
+				}
+			}
+		}
+	},
+	{
+		id: "palette/duplicate-stops",
+		description: "Two steps of a numeric color ramp have the same color.",
+		defaultSeverity: "warning",
+		run({ graph, report }) {
+			for (const { name, stops } of ramps(graph)) for (let i = 1; i < stops.length; i++) {
+				const a = graph.value(stops[i - 1].id);
+				const b = graph.value(stops[i].id);
+				if (a && b && compareValues("color", a, b).result !== "changed") report({
+					message: `Ramp "${name}": steps ${stops[i - 1].step} and ${stops[i].step} are the same color`,
+					nodes: [stops[i - 1].id, stops[i].id],
+					evidence: { ramp: name }
+				});
+			}
+		}
+	},
+	{
+		id: "a11y/contrast-matrix",
+		description: "Every text role over every surface role meets the minimum WCAG contrast in every context.",
+		defaultSeverity: "off",
+		run({ graph, options, report }) {
+			const text = asArray(options.text);
+			const surfaces = asArray(options.surfaces);
+			const min = typeof options.min === "number" ? options.min : 4.5;
+			const acknowledged = new Set(asArray(options.acknowledged));
+			if (text.length === 0 || surfaces.length === 0) return;
+			const textTokens = graph.tokens({ type: "color" }).filter((t) => text.some((p) => matchPath(t.id, p)));
+			const surfaceTokens = graph.tokens({ type: "color" }).filter((t) => surfaces.some((p) => matchPath(t.id, p)));
+			const inputs = graph.inputs().slice(0, 64);
+			for (const fg of textTokens) for (const bg of surfaceTokens) {
+				if (fg.id === bg.id) continue;
+				const failing = /* @__PURE__ */ new Map();
+				for (const input of inputs) {
+					const f = graph.value(fg.id, input);
+					const b = graph.value(bg.id, input);
+					if (!f || !b) continue;
+					const ratio = Math.round(contrastRatio(f, b) * 100) / 100;
+					if (ratio < min) failing.set(JSON.stringify(input), {
+						when: input,
+						ratio
+					});
+				}
+				if (failing.size === 0) continue;
+				const pair = `${fg.id} × ${bg.id}`;
+				const worst = [...failing.values()].sort((a, b) => a.ratio - b.ratio)[0];
+				const all = failing.size === inputs.length;
+				const finding = {
+					message: `${pair}: contrast ${worst.ratio} is below ${min}${all ? "" : ` in ${failing.size} of ${inputs.length} contexts`}`,
+					nodes: [fg.id, bg.id],
+					evidence: {
+						ratio: worst.ratio,
+						min,
+						contexts: [...failing.values()].map((f) => f.when)
+					},
+					...all ? {} : { when: worst.when }
+				};
+				report(acknowledged.has(pair) ? {
+					...finding,
+					severity: "info",
+					message: `${finding.message} (acknowledged)`
+				} : finding);
+			}
+		}
+	},
+	aliasDepth,
+	allowedSources,
+	hardcodedColor,
+	offScale,
+	deprecatedUsage,
+	unknownToken,
+	unusedToken
+];
+const RANK$1 = {
+	error: 3,
+	warning: 2,
+	info: 1
+};
+/** Rule defaults → presets from `extends` (in order) → `rules` from the config. */
+function resolveSettings(config, rules = RULES) {
+	const settings = /* @__PURE__ */ new Map();
+	for (const r of rules) settings.set(r.id, {
+		severity: r.defaultSeverity,
+		options: {}
+	});
+	const apply = (entries) => {
+		for (const [id, value] of Object.entries(entries)) {
+			const prev = settings.get(id) ?? {
+				severity: "warning",
+				options: {}
+			};
+			if (Array.isArray(value)) settings.set(id, {
+				severity: value[0],
+				options: {
+					...prev.options,
+					...value[1]
+				}
+			});
+			else settings.set(id, {
+				...prev,
+				severity: value
+			});
+		}
+	};
+	for (const name of config.extends ?? ["recommended"]) {
+		const preset = PRESETS[name];
+		if (!preset) throw new Error(`Unknown preset "${name}". Available: ${Object.keys(PRESETS).join(", ")}`);
+		apply(preset);
+	}
+	apply(config.rules ?? {});
+	return settings;
+}
+/**
+* Runs the rules over a graph. Parse diagnostics of the snapshot are reported as findings too;
+* their severity can be overridden (or turned off) by code in `rules`.
+*/
+async function check(graph, config = {}, extraRules = [], opts = {}) {
+	const rules = [...RULES, ...extraRules];
+	const settings = resolveSettings(config, rules);
+	const code = opts.code;
+	const vars = code ? new VarMatcher(graph, code.uses.map((u) => u.name), config.code?.prefix) : void 0;
+	const drafts = [];
+	const byOrigin = /* @__PURE__ */ new Map();
+	for (const t of graph.tokens()) byOrigin.set(`${t.origin.file}#${t.origin.pointer}`, t.id);
+	for (const d of graph.snapshot.diagnostics) {
+		const severity = settings.get(d.code)?.severity ?? d.severity;
+		if (severity === "off") continue;
+		const node = d.loc ? byOrigin.get(`${d.loc.file}#${d.loc.pointer}`) : void 0;
+		const f = {
+			rule: d.code,
+			severity,
+			message: d.message,
+			nodes: node ? [node] : []
+		};
+		if (d.loc) f.loc = d.loc;
+		drafts.push(f);
+	}
+	for (const rule of rules) {
+		const setting = settings.get(rule.id);
+		if (setting.severity === "off") continue;
+		const ctx = {
+			graph,
+			options: setting.options,
+			config,
+			...code && vars ? {
+				code,
+				vars
+			} : {},
+			report(r) {
+				const f = {
+					rule: rule.id,
+					severity: r.severity && RANK$1[r.severity] < RANK$1[setting.severity] ? r.severity : setting.severity,
+					message: r.message,
+					nodes: r.nodes
+				};
+				if (r.evidence) f.evidence = r.evidence;
+				if (r.when) f.when = r.when;
+				if (r.loc) f.loc = r.loc;
+				else if (r.token) f.loc = r.token.origin;
+				drafts.push(f);
+			}
+		};
+		rule.run(ctx);
+	}
+	const findings = [];
+	for (const d of drafts) findings.push({
+		id: `${d.rule}#${(await sha256Hex(canonicalize(d.loc?.line ? {
+			n: d.nodes,
+			w: d.when,
+			m: d.message,
+			l: d.loc
+		} : {
+			n: d.nodes,
+			w: d.when,
+			m: d.message
+		}))).slice(0, 12)}`,
+		...d
+	});
+	return findings.sort((a, b) => RANK$1[b.severity] - RANK$1[a.severity] || a.rule.localeCompare(b.rule) || a.message.localeCompare(b.message));
+}
+//#endregion
+//#region ../dsgraph-sources/dist/node.js
+const SKIP = /* @__PURE__ */ new Set(["node_modules", ".git"]);
+/** Node file system rooted at a directory. CLI and GitHub Action only. */
+var NodeFsSource = class {
+	root;
+	id;
+	files;
+	constructor(root) {
+		this.root = root;
+		this.id = `node:${root}`;
+	}
+	async walk() {
+		const out = [];
+		const visit = async (dir) => {
+			for (const entry of await readdir(dir, { withFileTypes: true })) if (entry.isDirectory()) {
+				if (!SKIP.has(entry.name)) await visit(join(dir, entry.name));
+			} else if (entry.isFile()) out.push(relative(this.root, join(dir, entry.name)).split(sep).join("/"));
+		};
+		await visit(this.root);
+		return out.sort();
+	}
+	async list(patterns) {
+		this.files ??= await this.walk();
+		return this.files.filter((p) => matchGlob(p, patterns));
+	}
+	async readText(path) {
+		return readFile(join(this.root, ...path.split("/")), "utf8");
+	}
+	async meta() {
+		return {
+			kind: "folder",
+			path: this.root
 		};
 	}
 };
@@ -19536,42 +24291,6 @@ function remoteSource(spec, opts = {}) {
 	return new GitHubSource(spec.repo, spec.ref, o);
 }
 //#endregion
-//#region ../dsgraph-sources/dist/node.js
-const SKIP = /* @__PURE__ */ new Set(["node_modules", ".git"]);
-/** Node file system rooted at a directory. CLI and GitHub Action only. */
-var NodeFsSource = class {
-	root;
-	id;
-	files;
-	constructor(root) {
-		this.root = root;
-		this.id = `node:${root}`;
-	}
-	async walk() {
-		const out = [];
-		const visit = async (dir) => {
-			for (const entry of await readdir(dir, { withFileTypes: true })) if (entry.isDirectory()) {
-				if (!SKIP.has(entry.name)) await visit(join(dir, entry.name));
-			} else if (entry.isFile()) out.push(relative(this.root, join(dir, entry.name)).split(sep).join("/"));
-		};
-		await visit(this.root);
-		return out.sort();
-	}
-	async list(patterns) {
-		this.files ??= await this.walk();
-		return this.files.filter((p) => matchGlob(p, patterns));
-	}
-	async readText(path) {
-		return readFile(join(this.root, ...path.split("/")), "utf8");
-	}
-	async meta() {
-		return {
-			kind: "folder",
-			path: this.root
-		};
-	}
-};
-//#endregion
 //#region ../dsgraph-cli/dist/sources.js
 /**
 * Turns a source argument into a graph:
@@ -19738,18 +24457,38 @@ async function run(rt) {
 		const cs = await diff(base, head, diffOptions(config));
 		const types = new Map([...base.tokens(), ...head.tokens()].map((t) => [t.id, t.type]));
 		const level = cs.changes.length ? cs.summary.level : "none";
+		const codePath = input(rt, "code") || (config.code ? "." : "");
+		let code;
+		if (codePath) {
+			const root = posix.normalize(codePath.split("\\").join("/")).replace(/^\.\/?|\/$/g, "");
+			const within = (globs) => globs.map((g) => root ? `${root}/${g}` : g);
+			const scanOpts = { include: config.code?.include ?? within(["**/*.css", "**/*.scss"]) };
+			if (config.code?.exclude) scanOpts.exclude = config.code.exclude;
+			code = await scanStyles(new NodeFsSource(workspace), scanOpts);
+		}
+		const impact = code ? impactOf(cs, base, head, code, config.code?.prefix ? { prefix: config.code.prefix } : {}) : void 0;
 		const here = path === "." ? "this branch" : path;
 		let body = formatChangeset(cs, {
 			format: "markdown",
-			types
+			types,
+			...impact ? { impact } : {}
 		}).split(headPath).join(here).split(`${workspace}/`).join("");
+		if (code && pr && token) {
+			const changed = await changedFiles(rt, {
+				repo,
+				pr: pr.number,
+				token
+			});
+			const styles = changed ? (await check(head, config, [], { code })).filter((f) => /^(style|usage)\//.test(f.rule) && f.loc?.file && changed.has(f.loc.file)) : [];
+			if (styles.length) body += stylesSection(styles);
+		}
 		if (input(rt, "checks", "true") !== "false") {
 			const findings = await check(head, config);
 			if (findings.length) body += `\n<details><summary>Checks on the new version (${findings.length})</summary>\n\n${formatFindings(findings, { format: "markdown" })}\n</details>\n`;
 		}
 		body += "\n<sub>[dsgraph](https://github.com/specsure/specsure) · design tokens compared as a graph</sub>\n";
 		if (rt.env.GITHUB_STEP_SUMMARY) await rt.appendText(rt.env.GITHUB_STEP_SUMMARY, `${body}\n`);
-		if (rt.env.GITHUB_OUTPUT) await rt.appendText(rt.env.GITHUB_OUTPUT, `level=${level}\nchanges=${cs.changes.filter((c) => c.origin === "direct").length}\nbreaking=${cs.changes.filter((c) => c.level === "major").length}\n`);
+		if (rt.env.GITHUB_OUTPUT) await rt.appendText(rt.env.GITHUB_OUTPUT, `level=${level}\nchanges=${cs.changes.filter((c) => c.origin === "direct").length}\nbreaking=${cs.changes.filter((c) => c.level === "major").length}\ncode-breaks=${impact?.breaks ?? 0}\n`);
 		rt.log(`dsgraph: ${level === "none" ? "no impact" : `${level} release`} (${baseSpec} → ${path})`);
 		if (pr && token && input(rt, "comment", "true") !== "false") await comment(rt, {
 			repo,
@@ -19767,6 +24506,33 @@ async function run(rt) {
 		rt.log(command("error", `dsgraph: ${e.message}`));
 		return 2;
 	}
+}
+/** Style findings in the files this pull request touches: the ones its author can fix now. */
+function stylesSection(findings) {
+	return `\n### Styles in this pull request (${findings.length})\n\n${formatFindings(findings, {
+		format: "markdown",
+		heading: false
+	})}\n`;
+}
+/** Paths changed by the pull request, or undefined when GitHub does not say. */
+async function changedFiles(rt, o) {
+	const api = rt.env.GITHUB_API_URL ?? "https://api.github.com";
+	const files = /* @__PURE__ */ new Set();
+	try {
+		for (let page = 1; page <= 30; page++) {
+			const res = await rt.fetch(`${api}/repos/${o.repo}/pulls/${o.pr}/files?per_page=100&page=${page}`, { headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${o.token}`
+			} });
+			if (!res.ok) return void 0;
+			const list = await res.json();
+			for (const f of list) if (f.status !== "removed") files.add(f.filename);
+			if (list.length < 100) break;
+		}
+	} catch {
+		return;
+	}
+	return files;
 }
 /** GitHub refuses comments over 65 536 characters; a long report is cut at a line, the summary keeps all of it. */
 function fit(body, limit = 6e4) {
