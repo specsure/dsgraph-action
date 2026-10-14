@@ -7770,9 +7770,10 @@ function canonicalDimension(raw, ctx) {
 var VarMatcher = class {
 	graph;
 	prefixes;
+	suffixes;
 	constructor(graph, names = [], prefix) {
 		this.graph = graph;
-		this.prefixes = prefix ? [normalizeName(prefix.replace(/^--/, ""))] : learnPrefixes(graph, names);
+		this.prefixes = prefix ? [normalizeName(prefix.replace(/^--/, ""))] : learnPrefixes(graph, names, (n) => this.byName(n));
 	}
 	/** The token a custom property names, or undefined. */
 	token(name) {
@@ -7792,17 +7793,33 @@ var VarMatcher = class {
 	get prefix() {
 		return this.prefixes[0];
 	}
+	/**
+	* A token by normalized name: the whole path, or else the end of exactly one path. Exports that
+	* group variables by category (`colors.--gray-9`, `spacing.space.4`) match their names in code.
+	*/
 	byName(n) {
 		const hits = this.graph.byCssVar(`--${n}`);
-		return hits.length === 1 ? hits[0] : void 0;
+		if (hits.length) return hits.length === 1 ? hits[0] : void 0;
+		if (!this.suffixes) {
+			this.suffixes = /* @__PURE__ */ new Map();
+			for (const t of this.graph.tokens()) {
+				const segs = normalizeName(t.id).split(".");
+				for (let i = 1; i < segs.length; i++) {
+					const key = segs.slice(i).join(".");
+					this.suffixes.set(key, [...this.suffixes.get(key) ?? [], t]);
+				}
+			}
+		}
+		const tail = this.suffixes.get(n);
+		return tail?.length === 1 ? tail[0] : void 0;
 	}
 };
 /** Leading segments that, removed, turn most names that carry them into token names. */
-function learnPrefixes(graph, names) {
+function learnPrefixes(graph, names, byName) {
 	const stats = /* @__PURE__ */ new Map();
 	for (const name of new Set(names)) {
 		const n = normalizeName(name.replace(/^--/, ""));
-		if (graph.token(name.replace(/^--/, "")) || graph.byCssVar(`--${n}`).length) continue;
+		if (graph.token(name.replace(/^--/, "")) || byName(n)) continue;
 		const dot = n.indexOf(".");
 		if (dot < 0) continue;
 		const head = n.slice(0, dot);
@@ -7811,7 +7828,7 @@ function learnPrefixes(graph, names) {
 			hits: 0
 		};
 		s.total++;
-		if (graph.byCssVar(`--${n.slice(dot + 1)}`).length === 1) s.hits++;
+		if (byName(n.slice(dot + 1))) s.hits++;
 		stats.set(head, s);
 	}
 	return [...stats].filter(([, s]) => s.hits >= 2 && s.hits / s.total >= .5).sort((a, b) => b[1].hits - a[1].hits || a[0].localeCompare(b[0])).map(([p]) => p);
@@ -11433,7 +11450,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.3.0";
+const GENERATOR = "dsgraph@0.4.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -23248,7 +23265,9 @@ function formatChangeset(cs, opts = {}) {
 	const impactBy = new Map((opts.impact?.changes ?? []).map((ci) => [ci.change, ci]));
 	const propagatedBy = /* @__PURE__ */ new Map();
 	for (const c of cs.changes) for (const cause of c.cause) propagatedBy.set(cause, [...propagatedBy.get(cause) ?? [], c]);
-	const shown = cs.changes.filter((c) => !(c.origin === "propagated" && c.cause.length > 0));
+	const listed = cs.changes.filter((c) => !(c.origin === "propagated" && c.cause.length > 0));
+	const shown = !!(opts.focusOnCode && opts.impact) ? listed.filter((c) => impactBy.has(c.id) || c.level === "major") : listed;
+	const hidden = listed.length - shown.length;
 	const counts = cs.summary.counts;
 	const summary = [
 		counts.removed ? `${counts.removed} removed` : "",
@@ -23295,6 +23314,7 @@ function formatChangeset(cs, opts = {}) {
 		lines.push("");
 		if (collapsible) lines.push("</details>", "");
 	}
+	if (hidden) lines.push(`${hidden} other ${hidden === 1 ? "change does" : "changes do"} not reach the code.`, "");
 	if (cs.contexts.partial) lines.push(md ? "> Some contexts were not fully compared (too many permutations)." : "Note: some contexts were not fully compared.", "");
 	return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
@@ -23446,6 +23466,10 @@ function excepted(options) {
 	const values = new Set(asArray$1(ex.values).map((v) => v.toLowerCase()));
 	return (l) => files.length > 0 && matchGlob(l.file, files) || l.text !== void 0 && values.has(l.text.toLowerCase());
 }
+const pxOf = (v) => {
+	const d = v;
+	return d.unit === "rem" ? d.value * 16 : d.value;
+};
 const locOf = (l) => ({
 	file: l.file,
 	line: l.line,
@@ -23532,6 +23556,7 @@ const offScale = {
 			const scale = scaleOf(graph, l.property, scales);
 			const near = nearestIn(graph, l, new Set(scale.map((t) => t.id)));
 			if (!near) continue;
+			if (!near.exact && /radius$/i.test(l.property) && pxOf(l.value) >= 100) continue;
 			const px = near.value;
 			report({
 				message: near.exact ? `"${l.text}" in ${l.property} is on the scale; use "${near.token.id}"` : `"${l.text}" in ${l.property} is off the scale; closest is "${near.token.id}" (${px.value}${px.unit})`,
@@ -24368,6 +24393,65 @@ async function toSource(spec, config, cwd) {
 		}
 	};
 }
+//#endregion
+//#region ../dsgraph-cli/dist/upgrade.js
+const MANIFEST_FILES = {
+	lock: "package-lock.json",
+	pnpmLock: "pnpm-lock.yaml",
+	yarnLock: "yarn.lock",
+	pkg: "package.json"
+};
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+const VERSION$1 = /^\d+\.\d+\.\d+(?:-[\w.]+)?/;
+function fromNpmLock(text, name) {
+	try {
+		const lock = JSON.parse(text);
+		return lock.packages?.[`node_modules/${name}`]?.version ?? lock.dependencies?.[name]?.version;
+	} catch {
+		return;
+	}
+}
+/** pnpm 6–9: `/@acme/tokens@1.2.3:` or `'@acme/tokens@1.2.3':` under `packages:`. */
+function fromPnpmLock(text, name) {
+	return new RegExp(`^\\s+['"]?/?${escapeRe(name)}@(\\d[^:'"(\\s]*)`, "m").exec(text)?.[1];
+}
+/** yarn 1 (`version "1.2.3"`) and berry (`version: 1.2.3`), after the entry for the package. */
+function fromYarnLock(text, name) {
+	return new RegExp(`^"?${escapeRe(name)}@[^\\n]*:\\n(?:[ \\t]+[^\\n]*\\n)*?[ \\t]+version:? "?([^"\\n]+)"?`, "m").exec(text)?.[1]?.trim();
+}
+/** The range in package.json; `workspace:` and aliases mean it is not an npm version. */
+function fromPackageJson(text, name) {
+	try {
+		const pkg = JSON.parse(text);
+		for (const field of [
+			"dependencies",
+			"devDependencies",
+			"peerDependencies",
+			"optionalDependencies"
+		]) {
+			const range = pkg[field]?.[name];
+			if (range && !/^(workspace|file|link|npm|git|github|https?):/.test(range)) return range;
+		}
+	} catch {}
+}
+/**
+* The version of a dependency a project uses: exact from a lockfile when there is one, otherwise
+* the range from package.json (an npm source resolves it). Undefined when the project does not use it.
+*/
+function dependencyVersion(m, name) {
+	const exact = m.lock && fromNpmLock(m.lock, name) || m.pnpmLock && fromPnpmLock(m.pnpmLock, name) || m.yarnLock && fromYarnLock(m.yarnLock, name);
+	if (exact && VERSION$1.test(exact)) return exact;
+	return m.pkg ? fromPackageJson(m.pkg, name) : void 0;
+}
+/** Reads the package files of a folder. */
+async function readManifests(dir) {
+	const out = {};
+	await Promise.all(Object.entries(MANIFEST_FILES).map(async ([key, file]) => {
+		const text = await readFile(join(dir, file), "utf8").catch(() => void 0);
+		if (text !== void 0) out[key] = text;
+	}));
+	return out;
+}
 /** Reads `dsgraph.config.json` (or the given file) from `cwd`; no file means an empty config. */
 async function loadConfig(path, cwd) {
 	const file = resolve(cwd, path ?? "dsgraph.config.json");
@@ -24445,7 +24529,34 @@ async function run(rt) {
 				}
 			};
 		}
+		const pkg = input(rt, "package");
+		let headSpec;
 		let baseSpec = input(rt, "base");
+		if (pkg) {
+			if (!pr || !token) {
+				rt.log(command("error", "`package` needs a pull_request event and `github-token`"));
+				return 2;
+			}
+			const dirs = [.../* @__PURE__ */ new Set([".", input(rt, "code") || "."])];
+			const v = await packageVersions(rt, {
+				repo,
+				ref: pr.base.sha,
+				token,
+				workspace,
+				dirs
+			}, pkg);
+			if (!v.head) {
+				rt.log(command("error", `${pkg} is not a dependency of this repository (no lockfile or package.json entry)`));
+				return 2;
+			}
+			if (!v.base || v.base === v.head) {
+				rt.log(`dsgraph: ${pkg} ${v.base ? `stays at ${v.head}` : `is new (${v.head})`}; nothing to compare`);
+				if (rt.env.GITHUB_OUTPUT) await rt.appendText(rt.env.GITHUB_OUTPUT, "level=none\nchanges=0\nbreaking=0\ncode-breaks=0\n");
+				return 0;
+			}
+			baseSpec = `npm:${pkg}@${v.base}`;
+			headSpec = `npm:${pkg}@${v.head}`;
+		}
 		if (!baseSpec) {
 			if (!pr) {
 				rt.log(command("error", "Set `base`, or run the action on pull_request"));
@@ -24453,11 +24564,11 @@ async function run(rt) {
 			}
 			baseSpec = `github:${repo}${folder && folder !== "." ? `/${posix.normalize(folder)}` : ""}@${pr.base.sha}`;
 		}
-		const [base, head] = await Promise.all([loadGraph(baseSpec, config, workspace), isFile ? loadGraph(folder || ".", config, workspace) : loadGraph(headPath, config, workspace)]);
+		const [base, head] = await Promise.all([loadGraph(baseSpec, config, workspace), headSpec ? loadGraph(headSpec, config, workspace) : isFile ? loadGraph(folder || ".", config, workspace) : loadGraph(headPath, config, workspace)]);
 		const cs = await diff(base, head, diffOptions(config));
 		const types = new Map([...base.tokens(), ...head.tokens()].map((t) => [t.id, t.type]));
 		const level = cs.changes.length ? cs.summary.level : "none";
-		const codePath = input(rt, "code") || (config.code ? "." : "");
+		const codePath = input(rt, "code") || (config.code || pkg ? "." : "");
 		let code;
 		if (codePath) {
 			const root = posix.normalize(codePath.split("\\").join("/")).replace(/^\.\/?|\/$/g, "");
@@ -24471,7 +24582,8 @@ async function run(rt) {
 		let body = formatChangeset(cs, {
 			format: "markdown",
 			types,
-			...impact ? { impact } : {}
+			...impact ? { impact } : {},
+			focusOnCode: !!pkg
 		}).split(headPath).join(here).split(`${workspace}/`).join("");
 		if (code && pr && token) {
 			const changed = await changedFiles(rt, {
@@ -24482,14 +24594,14 @@ async function run(rt) {
 			const styles = changed ? (await check(head, config, [], { code })).filter((f) => /^(style|usage)\//.test(f.rule) && f.loc?.file && changed.has(f.loc.file)) : [];
 			if (styles.length) body += stylesSection(styles);
 		}
-		if (input(rt, "checks", "true") !== "false") {
+		if (input(rt, "checks", pkg ? "false" : "true") !== "false") {
 			const findings = await check(head, config);
 			if (findings.length) body += `\n<details><summary>Checks on the new version (${findings.length})</summary>\n\n${formatFindings(findings, { format: "markdown" })}\n</details>\n`;
 		}
 		body += "\n<sub>[dsgraph](https://github.com/specsure/specsure) · design tokens compared as a graph</sub>\n";
 		if (rt.env.GITHUB_STEP_SUMMARY) await rt.appendText(rt.env.GITHUB_STEP_SUMMARY, `${body}\n`);
 		if (rt.env.GITHUB_OUTPUT) await rt.appendText(rt.env.GITHUB_OUTPUT, `level=${level}\nchanges=${cs.changes.filter((c) => c.origin === "direct").length}\nbreaking=${cs.changes.filter((c) => c.level === "major").length}\ncode-breaks=${impact?.breaks ?? 0}\n`);
-		rt.log(`dsgraph: ${level === "none" ? "no impact" : `${level} release`} (${baseSpec} → ${path})`);
+		rt.log(`dsgraph: ${level === "none" ? "no impact" : `${level} release`} (${baseSpec} → ${headSpec ?? path})`);
 		if (pr && token && input(rt, "comment", "true") !== "false") await comment(rt, {
 			repo,
 			pr: pr.number,
@@ -24506,6 +24618,33 @@ async function run(rt) {
 		rt.log(command("error", `dsgraph: ${e.message}`));
 		return 2;
 	}
+}
+/** The versions of a dependency before (base commit, read through the API) and after (the checkout). */
+async function packageVersions(rt, o, name) {
+	const api = rt.env.GITHUB_API_URL ?? "https://api.github.com";
+	const atBase = async (dir) => {
+		const out = {};
+		for (const [key, file] of Object.entries(MANIFEST_FILES)) {
+			const path = posix.join(dir, file);
+			const res = await rt.fetch(`${api}/repos/${o.repo}/contents/${path}?ref=${o.ref}`, { headers: {
+				Accept: "application/vnd.github.raw",
+				Authorization: `Bearer ${o.token}`
+			} }).catch(() => void 0);
+			if (res?.ok) out[key] = await res.text();
+		}
+		return out;
+	};
+	const first = async (read) => {
+		for (const dir of o.dirs) {
+			const v = dependencyVersion(await read(dir), name);
+			if (v) return v;
+		}
+	};
+	const [base, head] = await Promise.all([first(atBase), first((dir) => readManifests(join(o.workspace, dir)))]);
+	const out = {};
+	if (base) out.base = base;
+	if (head) out.head = head;
+	return out;
 }
 /** Style findings in the files this pull request touches: the ones its author can fix now. */
 function stylesSection(findings) {
