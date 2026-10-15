@@ -11478,7 +11478,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.6.0";
+const GENERATOR = "dsgraph@0.6.1";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -35608,9 +35608,12 @@ function formatDelta(delta) {
 	if (delta.unit !== void 0) parts.push(`unit: ${String(delta.unit)}`);
 	return parts.join(", ");
 }
+const SHA = /^[0-9a-f]{40}$/i;
+/** A branch or tag with its commit, `main (7c970d9)`; a commit once and short. */
+const refOf = (ref, commit) => !ref ? commit?.slice(0, 7) ?? "HEAD" : SHA.test(ref) ? ref.slice(0, 7) : `${ref}${commit && commit !== ref ? ` (${commit.slice(0, 7)})` : ""}`;
 function formatSource(s) {
 	if (s.kind === "npm") return `npm:${s.package}@${s.version}`;
-	if (s.kind === "github") return `github:${s.repo}${s.path ? `/${s.path}` : ""}@${s.ref}${s.commit ? ` (${s.commit.slice(0, 7)})` : ""}`;
+	if (s.kind === "github") return `github:${s.repo}${s.path ? `/${s.path}` : ""}@${refOf(s.ref, s.commit)}`;
 	if (s.path) return s.path;
 	return s.kind;
 }
@@ -35904,7 +35907,6 @@ const ICON = {
 	warning: "▲",
 	info: "•"
 };
-/** Findings of one rule whose messages differ only in quoted values (`Color "…" is a string`). */
 /** `file:line` when a finding points into code, the file alone otherwise. */
 const where = (loc) => `${loc.file}${loc.line ? `:${loc.line}` : ""}`;
 const QUOTED = /"[^"]*"/g;
@@ -35943,6 +35945,25 @@ function restoreShared(messages) {
 		return parts.every((ps) => ps[k] === q) ? q : mask(q);
 	});
 }
+/**
+* The group's message with the quoted values that differ listed in their place, up to `max` of them:
+* `"10px", "2px" in padding is off the scale`. Numbers that differ stay masked.
+*/
+function listed(g, max = 3) {
+	const messages = g.findings.map((f) => f.message);
+	const parts = messages.map((m) => m.match(VARIABLE) ?? []);
+	let i = 0;
+	return messages[0].replace(VARIABLE, (q) => {
+		const k = i++;
+		const values = [...new Set(parts.map((ps) => ps[k] ?? ""))];
+		if (values.length === 1) return q;
+		if (!q.startsWith("\"")) return mask(q);
+		return `${values.slice(0, max).join(", ")}${values.length > max ? ` and ${values.length - max} more` : ""}`;
+	});
+}
+/** Markdown: quoted values as code, so a color alone in backticks gets GitHub's swatch. */
+const quotedAsCode = (s) => s.replace(/"([^"`]*)"/g, "`$1`");
+const quotedAsHtml = (s) => escapeHtml(s).replace(/"([^"]*)"/g, "<code>$1</code>");
 /** What tells one finding of a group from another: its token, else the quoted values of its message. */
 function findingLabel(f) {
 	return `${f.nodes[0] ?? f.message.match(QUOTED)?.join(" ") ?? f.message}${formatWhen(f.when)}`;
@@ -35966,14 +35987,14 @@ function formatFindings(findings, opts = {}) {
 	const summary = summaryOf(findings);
 	const head = opts.heading === false ? "" : `## dsgraph check — ${summary}\n\n`;
 	if (md) {
-		if (!grouped) return `${head}| | Rule | Finding | File |\n|---|---|---|---|\n${findings.map((f) => `| ${ICON[f.severity]} ${f.severity} | \`${f.rule}\` | ${cell(f.message)}${formatWhen(f.when)} | ${f.loc?.file ? `\`${where(f.loc)}\`` : ""} |`).join("\n")}\n`;
+		if (!grouped) return `${head}| | Rule | Finding | File |\n|---|---|---|---|\n${findings.map((f) => `| ${ICON[f.severity]} ${f.severity} | \`${f.rule}\` | ${cell(quotedAsCode(f.message))}${formatWhen(f.when)} | ${f.loc?.file ? `\`${where(f.loc)}\`` : ""} |`).join("\n")}\n`;
 		const groups = groupFindings(findings);
 		const max = opts.maxListed ?? 50;
-		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(g.pattern)}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.findings.length === 1 && g.findings[0].loc?.file ? `\`${where(g.findings[0].loc)}\`` : g.file ? `\`${g.file}\`` : ""} |`);
+		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(quotedAsCode(listed(g)))}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.findings.length === 1 && g.findings[0].loc?.file ? `\`${where(g.findings[0].loc)}\`` : g.file ? `\`${g.file}\`` : ""} |`);
 		const details = groups.filter((g) => g.findings.length > 1).map((g) => {
-			const items = g.findings.slice(0, max).map((f) => `- ${cell(f.message)}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : ""}`);
+			const items = g.findings.slice(0, max).map((f) => `- ${cell(quotedAsCode(f.message))}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : ""}`);
 			if (g.findings.length > max) items.push(`- … and ${g.findings.length - max} more`);
-			return `<details><summary>${ICON[g.severity]} <code>${g.rule}</code> — ${g.findings.length} × ${escapeHtml(g.pattern)}</summary>\n\n${items.join("\n")}\n\n</details>`;
+			return `<details><summary>${ICON[g.severity]} <code>${g.rule}</code> — ${g.findings.length} × ${quotedAsHtml(listed(g))}</summary>\n\n${items.join("\n")}\n\n</details>`;
 		});
 		return `${head}| | Rule | Count | Finding | File |\n|---|---|---|---|---|\n${rows.join("\n")}\n${details.length ? `\n${details.join("\n\n")}\n` : ""}`;
 	}
