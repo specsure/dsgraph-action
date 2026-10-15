@@ -7882,12 +7882,43 @@ const COMPATIBLE = {
 	number: ["number", "fontWeight"],
 	fontWeight: ["fontWeight", "number"]
 };
+/** What a token is for, by words in its name: text, a background, a border or outline, a shadow. */
+const ROLES = {
+	text: /(^|\.)(fg|foreground|text|ink|content|on|link|icon)(\.|$)/,
+	background: /(^|\.)(bg|background|surface|canvas|fill|container|layer|backdrop)(\.|$)/,
+	border: /(^|\.)(border|stroke|outline|divider|separator|ring)(\.|$)/,
+	shadow: /(^|\.)(shadow|elevation)(\.|$)/
+};
+/** The role a CSS property's value plays: `color` is text, `background-color` a background. */
+function roleOfProperty(property) {
+	const p = property.toLowerCase();
+	if (/^(color|caret-color|-webkit-text-fill-color|text-decoration-color|text-emphasis-color)$/.test(p)) return "text";
+	if (/^background(-color)?$|^(fill)$/.test(p)) return "background";
+	if (/^(border|outline|column-rule)(-(top|right|bottom|left|block|inline)(-(start|end))?)?(-color)?$|^stroke$/.test(p)) return "border";
+	if (/shadow$/.test(p)) return "shadow";
+}
+const segments = (id) => id.split(".").length;
 /**
-* Tokens nearest to a value in one context. Deprecated ones go last; among equally close tokens,
-* the ones that reference another token (semantic tokens, which follow themes) come before the
-* primitives that hold the value.
+* How well a token's name says it is made for the role: 2 when the name starts with it (`bgColor.*`,
+* a general token), 1 when it says so further on (`selection.bgColor`), -1 when it names another
+* role, else 0.
 */
-function nearestTokens(graph, parsed, input, limit) {
+function roleScore(id, role) {
+	if (!role) return 0;
+	const name = normalizeName(id);
+	if (ROLES[role].test(name.split(".")[0])) return 2;
+	if (ROLES[role].test(name)) return 1;
+	return Object.keys(ROLES).some((r) => r !== role && ROLES[r].test(name)) ? -1 : 0;
+}
+/**
+* Tokens nearest to a value in one context. Deprecated ones go last. Among exact matches, tokens
+* made for the property's role come first (`fgColor.accent` for `color`, not `borderColor.accent`).
+* Among equally close tokens, the ones that reference another token (semantic tokens, which follow
+* themes) come before the primitives that hold the value; then general tokens before component ones
+* (`fgColor.accent` before `button.outline.fgColor.rest`), and the one others build on first.
+*/
+function nearestTokens(graph, parsed, input, limit, property) {
+	const role = property ? roleOfProperty(property) : void 0;
 	const types = COMPATIBLE[parsed.type] ?? [parsed.type];
 	const out = [];
 	const depth = /* @__PURE__ */ new Map();
@@ -7906,7 +7937,7 @@ function nearestTokens(graph, parsed, input, limit) {
 		out.push(m);
 		depth.set(m, graph.chain(token.id, input).length);
 	}
-	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || a.distance - b.distance || depth.get(b) - depth.get(a) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
+	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || (a.exact && b.exact ? roleScore(b.token.id, role) - roleScore(a.token.id, role) : 0) || a.distance - b.distance || Number(depth.get(b) > 1) - Number(depth.get(a) > 1) || segments(a.token.id) - segments(b.token.id) || depth.get(a) - depth.get(b) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
 }
 //#endregion
 //#region ../dsgraph-core/dist/diagnostics.js
@@ -11487,7 +11518,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.6.2";
+const GENERATOR = "dsgraph@0.6.3";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -36019,9 +36050,9 @@ function listed(g, max = 3) {
 /** Markdown: quoted values as code, so a color alone in backticks gets GitHub's swatch. */
 const quotedAsCode = (s) => s.replace(/"([^"`]*)"/g, "`$1`");
 const quotedAsHtml = (s) => escapeHtml(s).replace(/"([^"]*)"/g, "<code>$1</code>");
-/** What tells one finding of a group from another: its token, else the quoted values of its message. */
+/** What tells one finding of a group from another: its token, else the quoted values of its message, else its file. */
 function findingLabel(f) {
-	return `${f.nodes[0] ?? f.message.match(QUOTED)?.join(" ") ?? f.message}${formatWhen(f.when)}`;
+	return `${f.nodes[0] ?? f.message.match(QUOTED)?.join(" ") ?? f.loc?.file ?? f.message}${formatWhen(f.when)}`;
 }
 const summaryOf = (findings) => {
 	const counts = {
@@ -36047,7 +36078,7 @@ function formatFindings(findings, opts = {}) {
 		const max = opts.maxListed ?? 50;
 		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(quotedAsCode(listed(g)))}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.findings.length === 1 && g.findings[0].loc?.file ? `\`${where(g.findings[0].loc)}\`` : g.file ? `\`${g.file}\`` : ""} |`);
 		const details = groups.filter((g) => g.findings.length > 1).map((g) => {
-			const items = g.findings.slice(0, max).map((f) => `- ${cell(quotedAsCode(f.message))}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : ""}`);
+			const items = g.findings.slice(0, max).map((f) => `- ${cell(quotedAsCode(f.message))}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : f.loc?.file ? ` — \`${f.loc.file}\`` : ""}`);
 			if (g.findings.length > max) items.push(`- … and ${g.findings.length - max} more`);
 			return `<details><summary>${ICON[g.severity]} <code>${g.rule}</code> — ${g.findings.length} × ${quotedAsHtml(listed(g))}</summary>\n\n${items.join("\n")}\n\n</details>`;
 		});
@@ -36179,7 +36210,7 @@ function nearestIn(graph, l, among) {
 	const all = nearestTokens(graph, {
 		type: l.type,
 		value: l.value
-	}, graph.defaultInput(), among ? 1e4 : 1);
+	}, graph.defaultInput(), among ? 1e4 : 1, l.property);
 	return among ? all.find((m) => among.has(m.token.id)) : all[0];
 }
 const hardcodedColor = {
@@ -36192,7 +36223,7 @@ const hardcodedColor = {
 		const memo = /* @__PURE__ */ new Map();
 		for (const l of code.literals) {
 			if (l.type !== "color" || skip(l)) continue;
-			const key = l.text.toLowerCase();
+			const key = `${roleOfProperty(l.property) ?? ""}\u0000${l.text.toLowerCase()}`;
 			if (!memo.has(key)) memo.set(key, nearestIn(graph, l));
 			const near = memo.get(key);
 			if (!near) continue;
