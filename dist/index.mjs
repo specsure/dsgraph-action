@@ -8446,7 +8446,7 @@ function shadow(raw, ctx) {
 	const out = [];
 	for (const layer of layers) {
 		if (!isPlainObject(layer)) return invalid(ctx, "dtcg/invalid-shadow", "Each shadow must be an object");
-		const { inset, ...rest } = layer;
+		const { inset, alpha, ...rest } = layer;
 		if (rest.spread === void 0 && rest.blur !== void 0) {
 			if (!lenient(ctx, "dtcg/shadow-missing-spread", "shadow is missing \"spread\"; read as 0")) return void 0;
 			rest.spread = {
@@ -8463,6 +8463,15 @@ function shadow(raw, ctx) {
 		});
 		if (v === void 0) return void 0;
 		if (inset !== void 0 && typeof inset !== "boolean") return invalid(ctx, "dtcg/invalid-shadow", "inset must be a boolean");
+		if (alpha !== void 0) {
+			if (typeof alpha !== "number" || alpha < 0 || alpha > 1) return invalid(ctx, "dtcg/invalid-shadow", "alpha must be a number from 0 to 1");
+			if (!lenient(ctx, "dtcg/legacy-syntax", "shadow \"alpha\" is not DTCG; read as the color's alpha")) return void 0;
+			const color = v.color;
+			if (isPlainObject(color)) v.color = {
+				...color,
+				alpha
+			};
+		}
 		out.push({
 			...v,
 			inset: inset === true
@@ -11478,7 +11487,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.6.1";
+const GENERATOR = "dsgraph@0.6.2";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -33537,6 +33546,41 @@ function scanCssText(file, text, index, opts = {}) {
 		}
 	});
 }
+const SASS_DECL = /^\s*(--[\w-]+|\$?[a-z][\w-]*)\s*:\s+(.*?)\s*;?\s*$/i;
+const SASS_OLD_DECL = /^\s*:([a-z][\w-]*)\s+(.*?)\s*$/i;
+/**
+* Reads indented Sass (`.sass`): each declaration line is read as SCSS at its own line, so a line
+* the reader cannot make sense of is skipped, not the file. Selectors are not kept.
+*/
+function scanSassText(file, text, index, opts = {}) {
+	const offset = (opts.line ?? 1) - 1;
+	let comment = false;
+	text.split("\n").forEach((raw, i) => {
+		let line = raw;
+		if (comment) {
+			const end = line.indexOf("*/");
+			if (end < 0) return;
+			comment = false;
+			line = line.slice(end + 2);
+		}
+		line = line.replace(/\/\*.*?\*\//g, "");
+		const start = line.indexOf("/*");
+		if (start >= 0) {
+			comment = true;
+			line = line.slice(0, start);
+		}
+		line = line.replace(/(^|\s)\/\/.*$/, "");
+		const m = SASS_DECL.exec(line) ?? SASS_OLD_DECL.exec(line);
+		if (!m?.[2]) return;
+		try {
+			scanCssText(file, `${m[1]}: ${m[2]};`, index, {
+				scss: true,
+				declarations: true,
+				line: i + 1 + offset
+			});
+		} catch {}
+	});
+}
 //#endregion
 //#region ../dsgraph-adapters/dist/tailwind.js
 /** Utility → the CSS property it sets and how its named values map to custom properties. */
@@ -34126,7 +34170,7 @@ function calleeName(n) {
 * Throws when the script does not parse.
 */
 function scanScriptText(file, text, index, opts = {}) {
-	const plugins = [];
+	const plugins = ["decorators-legacy"];
 	if (opts.jsx) plugins.push("jsx");
 	if (opts.typescript) plugins.push("typescript");
 	const ast = parse$2(text, {
@@ -34286,7 +34330,7 @@ function scanScriptText(file, text, index, opts = {}) {
 //#region ../dsgraph-adapters/dist/code.js
 /** Every style, script and markup file. */
 const CODE_INCLUDE = [
-	"**/*.{css,scss}",
+	"**/*.{css,scss,sass}",
 	"**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}",
 	"**/*.{vue,svelte,astro,html}"
 ];
@@ -34349,8 +34393,9 @@ function scanMarkupText(file, text, index) {
 	}
 	for (const m of text.matchAll(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi)) {
 		const at = m.index + m[0].indexOf(">") + 1;
-		scanCssText(file, m[2], index, {
-			scss: /lang=["']?s[ac]ss/i.test(m[1]),
+		if (/lang=["']?sass/i.test(m[1])) scanSassText(file, m[2], index, { line: lineAt(text, at) });
+		else scanCssText(file, m[2], index, {
+			scss: /lang=["']?scss/i.test(m[1]),
 			line: lineAt(text, at)
 		});
 		blank(m.index, m.index + m[0].length);
@@ -34386,6 +34431,7 @@ function scanMarkupText(file, text, index) {
 /** Reads one file of any supported kind into an index. Throws when it does not parse. */
 function scanFileText(file, text, index) {
 	if (/\.s?css$/i.test(file)) scanCssText(file, text, index, { scss: /\.scss$/i.test(file) });
+	else if (/\.sass$/i.test(file)) scanSassText(file, text, index);
 	else if (/\.(vue|svelte|astro|html?)$/i.test(file)) scanMarkupText(file, text, index);
 	else scanScriptText(file, text, index, {
 		typescript: /\.(m|c)?tsx?$/i.test(file),
@@ -35539,6 +35585,11 @@ function formatValue(type, value) {
 		return plain(value);
 	}
 }
+const SRGB = /* @__PURE__ */ new Set([
+	"srgb",
+	"hsl",
+	"hwb"
+]);
 function formatTyped(type, value) {
 	if (value === null || value === void 0) return "—";
 	switch (type) {
@@ -35546,12 +35597,16 @@ function formatTyped(type, value) {
 			if (!isObj(value) || !Array.isArray(value.components)) return plain(value);
 			const c = value;
 			const hex = colorToHex(c);
-			if (c.alpha < 1 && c.space === "srgb") {
-				const [r, g, b] = c.components.map((x) => Math.round(Number(x) * 255));
+			if (SRGB.has(c.space)) {
+				if (c.alpha >= 1) return hex;
+				const [r, g, b] = [
+					1,
+					3,
+					5
+				].map((i) => Number.parseInt(hex.slice(i, i + 2), 16));
 				return `rgb(${r} ${g} ${b} / ${Math.round(c.alpha * 100)}%)`;
 			}
-			const alpha = c.alpha < 1 ? ` ${Math.round(c.alpha * 100)}%` : "";
-			return c.space === "srgb" ? hex : `${hex}${alpha} (${c.space})`;
+			return `${hex}${c.alpha < 1 ? ` ${Math.round(c.alpha * 100)}%` : ""} (${c.space})`;
 		}
 		case "dimension":
 		case "duration": {
@@ -36106,14 +36161,16 @@ const FAMILIES = [
 		strict: false
 	}
 ];
+const NOT_SPACING = /(^|\.)(line|letter|border|outline|breakpoint)(\.|$)/;
 function scaleOf(graph, property, cache) {
 	const family = FAMILIES.find((f) => f.property.test(property));
 	let tokens = cache.get(family.names);
 	if (!tokens) {
 		const all = graph.tokens({ type: "dimension" });
-		const named = all.filter((t) => family.names.test(normalizeName(t.id)));
-		const others = FAMILIES.filter((f) => f.strict).map((f) => f.names);
-		tokens = named.length || family.strict ? named : all.filter((t) => !others.some((re) => re.test(normalizeName(t.id))));
+		const others = [...FAMILIES.filter((f) => f.strict).map((f) => f.names), NOT_SPACING];
+		const other = (t) => !family.strict && others.some((re) => re.test(normalizeName(t.id)));
+		const named = all.filter((t) => family.names.test(normalizeName(t.id)) && !other(t));
+		tokens = named.length || family.strict ? named : all.filter((t) => !other(t));
 		cache.set(family.names, tokens);
 	}
 	return tokens;
