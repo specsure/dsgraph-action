@@ -11478,7 +11478,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.5.0";
+const GENERATOR = "dsgraph@0.6.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -34399,7 +34399,8 @@ function scanFileText(file, text, index) {
 */
 async function scanCode(source, opts = {}) {
 	const exclude = [...DEFAULT_EXCLUDE, ...opts.exclude ?? []];
-	const files = (await source.list(opts.include ?? CODE_INCLUDE)).filter((f) => !matchGlob(f, exclude)).sort();
+	const all = (await source.list(opts.include ?? CODE_INCLUDE)).filter((f) => !matchGlob(f, exclude)).sort();
+	const files = opts.maxFiles !== void 0 ? all.slice(0, opts.maxFiles) : all;
 	await prefetch(source, files);
 	const index = {
 		files: [],
@@ -34407,6 +34408,7 @@ async function scanCode(source, opts = {}) {
 		literals: [],
 		skipped: []
 	};
+	if (files.length < all.length) index.limited = all.length;
 	for (const file of files) {
 		let text;
 		try {
@@ -35484,6 +35486,45 @@ const jsonTokens = {
 	}
 };
 //#endregion
+//#region ../dsgraph-report/dist/meaning.js
+function groupOf(c) {
+	if (c.level === "major") return "breaks";
+	if (c.level === "patch" || c.level === "none") return "quiet";
+	switch (c.kind) {
+		case "token.added": return "added";
+		case "token.deprecated": return "deprecated";
+		case "token.value-changed":
+		case "token.alias-retargeted": return "looks";
+		default: return "other";
+	}
+}
+const isColor = (v) => typeof v === "object" && v !== null && Array.isArray(v.components) && "space" in v;
+/** The value inside a changeset side (`{ raw, value }`), or the side itself. */
+const valueOfSide = (side) => typeof side === "object" && side !== null && "value" in side ? side.value : side;
+function colorDirection(before, after) {
+	const a = valueOfSide(before);
+	const b = valueOfSide(after);
+	if (!isColor(a) || !isColor(b)) return void 0;
+	const [l1, a1, b1] = toOklab(a);
+	const [l2, a2, b2] = toOklab(b);
+	const dL = l2 - l1;
+	const dC = Math.hypot(a2, b2) - Math.hypot(a1, b1);
+	const dH = Math.sqrt(Math.max(0, (a2 - a1) ** 2 + (b2 - b1) ** 2 - dC ** 2));
+	const dA = (b.alpha ?? 1) - (a.alpha ?? 1);
+	const largest = Math.max(Math.abs(dL), Math.abs(dC), dH);
+	if (Math.abs(dA) >= .01 && largest < .01) return "alpha";
+	if (largest === Math.abs(dL)) return dL > 0 ? "lighter" : "darker";
+	if (largest === Math.abs(dC)) return dC > 0 ? "more-saturated" : "less-saturated";
+	return "hue";
+}
+function colorSize(deltaE) {
+	if (deltaE < 1) return "invisible";
+	if (deltaE < 2) return "barely";
+	if (deltaE < 5) return "noticeable";
+	if (deltaE < 10) return "clear";
+	return "different";
+}
+//#endregion
 //#region ../dsgraph-report/dist/values.js
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const plain = (value) => typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value);
@@ -35505,8 +35546,12 @@ function formatTyped(type, value) {
 			if (!isObj(value) || !Array.isArray(value.components)) return plain(value);
 			const c = value;
 			const hex = colorToHex(c);
+			if (c.alpha < 1 && c.space === "srgb") {
+				const [r, g, b] = c.components.map((x) => Math.round(Number(x) * 255));
+				return `rgb(${r} ${g} ${b} / ${Math.round(c.alpha * 100)}%)`;
+			}
 			const alpha = c.alpha < 1 ? ` ${Math.round(c.alpha * 100)}%` : "";
-			return c.space === "srgb" ? `${hex}${alpha}` : `${hex}${alpha} (${c.space})`;
+			return c.space === "srgb" ? hex : `${hex}${alpha} (${c.space})`;
 		}
 		case "dimension":
 		case "duration": {
@@ -35515,16 +35560,21 @@ function formatTyped(type, value) {
 		}
 		case "fontFamily": return value.join(", ");
 		case "cubicBezier": return `cubic-bezier(${value.join(", ")})`;
-		case "shadow": return value.map((l) => [
-			l.inset ? "inset" : "",
-			...[
-				"offsetX",
-				"offsetY",
-				"blur",
-				"spread"
-			].map((k) => formatValue("dimension", l[k])),
-			formatValue("color", l.color)
-		].filter(Boolean).join(" ")).join(", ");
+		case "shadow": return value.map((l) => {
+			const len = (k) => {
+				const d = l[k];
+				return !d || d.value === 0 ? "0" : `${d.value}${d.unit}`;
+			};
+			const spread = len("spread");
+			return [
+				l.inset ? "inset" : "",
+				len("offsetX"),
+				len("offsetY"),
+				len("blur"),
+				spread === "0" ? "" : spread,
+				formatValue("color", l.color)
+			].filter(Boolean).join(" ");
+		}).join(", ");
 		case "border": {
 			const b = value;
 			return `${formatValue("dimension", b.width)} ${typeof b.style === "string" ? b.style : "dashed"} ${formatValue("color", b.color)}`;
@@ -35560,67 +35610,102 @@ function formatDelta(delta) {
 }
 function formatSource(s) {
 	if (s.kind === "npm") return `npm:${s.package}@${s.version}`;
-	if (s.kind === "github") return `github:${s.repo}@${s.ref}${s.commit ? ` (${s.commit.slice(0, 7)})` : ""}${s.path ? `/${s.path}` : ""}`;
+	if (s.kind === "github") return `github:${s.repo}${s.path ? `/${s.path}` : ""}@${s.ref}${s.commit ? ` (${s.commit.slice(0, 7)})` : ""}`;
 	if (s.path) return s.path;
 	return s.kind;
 }
 const formatWhen = (when) => when && Object.keys(when).length > 0 ? ` (${Object.entries(when).map(([k, v]) => `${k}: ${v}`).join(", ")})` : "";
 //#endregion
 //#region ../dsgraph-report/dist/changeset.js
-const LEVEL_TITLE = {
-	major: "Breaking (major)",
-	minor: "Minor",
-	patch: "Patch",
-	none: "No impact"
+const TITLE = {
+	major: "Breaking release",
+	minor: "Minor release",
+	patch: "Patch release",
+	none: "No visible changes"
 };
-const typeOf = (c) => {
-	const side = c.after ?? c.before;
-	if (side && typeof side === "object" && "type" in side) return side.type ?? null;
-	return null;
+const SECTION = {
+	breaks: "Breaks",
+	looks: "Looks different",
+	added: "New",
+	deprecated: "Deprecated",
+	other: "Other changes",
+	quiet: "Hard to notice"
 };
-/** One line describing a change; `type` comes from the head token when known. */
-function describe(c, types, code) {
-	const t = types.get(c.target) ?? typeOf(c);
-	const where = formatWhen(c.when);
-	switch (c.kind) {
-		case "token.added": return `added ${code(c.target)}`;
-		case "token.removed": {
-			const maybe = c.possibleRenames?.length ? ` — possibly renamed to ${c.possibleRenames.map(code).join(" or ")}` : "";
-			return `removed ${code(c.target)}${maybe}`;
+const DIRECTION = {
+	lighter: "lighter",
+	darker: "darker",
+	"more-saturated": "more saturated",
+	"less-saturated": "less saturated",
+	hue: "another hue",
+	alpha: "another opacity"
+};
+const SIZE = {
+	invisible: "invisible",
+	barely: "barely visible",
+	noticeable: "noticeable",
+	clear: "clearly visible",
+	different: "very different"
+};
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+/** One sentence under the title: what made the level, and what it means for the people who use the tokens. */
+function reasonOf(cs) {
+	const direct = cs.changes.filter((c) => c.origin === "direct");
+	if (cs.changes.length === 0) return "The two versions hold the same tokens with the same values.";
+	switch (cs.summary.level) {
+		case "major": {
+			const breaking = direct.filter((c) => c.level === "major");
+			const words = {
+				"token.removed": "removed",
+				"token.renamed": "renamed",
+				"token.type-changed": "given another type",
+				"token.missing-in-context": "left out of a theme"
+			};
+			const what = [...new Set(breaking.map((c) => words[c.kind]).filter(Boolean))].join(" or ") || "changed in a breaking way";
+			const n = breaking.length;
+			return `${plural(n, "token")} ${n === 1 ? "was" : "were"} ${what}: code and designs that use ${n === 1 ? "it" : "them"} stop working until they are updated.`;
 		}
-		case "token.renamed": return `renamed ${code(c.from ?? "?")} → ${code(c.target)}${c.confidence < .8 ? ` (likely, ${Math.round(c.confidence * 100)}%)` : ""}`;
-		case "token.value-changed": {
-			const delta = formatDelta(c.delta);
-			return `${code(c.target)}${where}: ${formatSide(t, c.before)} → ${formatSide(t, c.after)}${delta ? ` (${delta})` : ""}`;
-		}
-		case "token.notation-changed": return `${code(c.target)}${where}: same value, written differently`;
-		case "token.alias-retargeted": return `${code(c.target)}${where}: now ${formatSide(t, c.after)}, same value`;
-		case "token.type-changed": return `${code(c.target)}: type ${String(c.before)} → ${String(c.after)}`;
-		case "token.missing-in-context": return `${code(c.target)} is no longer defined${where}`;
-		case "token.contexts-changed": return `${code(c.target)}: depends on ${JSON.stringify(c.before)} → ${JSON.stringify(c.after)}`;
-		case "token.deprecated": {
-			const d = c.after;
-			return `deprecated ${code(c.target)}${d?.replacement ? ` — use ${code(d.replacement)}` : d?.reason ? ` — ${d.reason}` : ""}`;
-		}
-		case "token.undeprecated": return `no longer deprecated ${code(c.target)}`;
-		case "token.description-changed": return `${code(c.target)}: description changed`;
-		case "token.extensions-changed": return `${code(c.target)}: $extensions changed`;
-		case "group.extends-changed": return `group ${code(c.target)}: $extends ${String(c.before ?? "—")} → ${String(c.after ?? "—")}`;
-		case "context.added":
-		case "context.removed": return `${c.kind === "context.added" ? "added" : "removed"} context ${code(c.target)}`;
-		case "modifier.added":
-		case "modifier.removed": return `${c.kind === "modifier.added" ? "added" : "removed"} modifier ${code(c.target)}`;
-		default: return `${c.kind} ${code(c.target)}`;
+		case "minor": return "Values changed or tokens were added. Nothing that uses the tokens breaks, but people will see the difference.";
+		case "patch": return "Only changes that are hard to notice: tiny color or size shifts, references, descriptions.";
+		default: return "Only the way values are written changed; nobody will see a difference.";
 	}
 }
-const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
-/** `src/button.css:12, src/card.scss:4 and 3 more` */
-function sitesLine(ci, max, code) {
-	const listed = ci.sites.slice(0, max).map((s) => code(`${s.file}:${s.line}`));
-	const more = ci.sites.length > max ? ` and ${ci.sites.length - max} more` : "";
-	return `${ci.effect === "breaks" ? "breaks" : "changes"} ${plural(ci.sites.length, "place")} in the code: ${listed.join(", ")}${more}`;
+/** The difference in words: `lighter, noticeable (ΔE 3.4)`, `+2px`. */
+function differenceOf(c) {
+	const d = c.delta;
+	if (typeof d?.deltaEOK === "number") {
+		const dir = colorDirection(c.before, c.after);
+		return `${dir ? `${DIRECTION[dir]}, ` : ""}${SIZE[colorSize(d.deltaEOK)]} (ΔE ${d.deltaEOK})`;
+	}
+	return formatDelta(d && {
+		...d,
+		layers: void 0,
+		stops: void 0
+	}) || fieldsChanged(valueOfSide(c.before), valueOfSide(c.after));
 }
-/** Formats a changeset. Propagated value changes are listed under the direct change that caused them. */
+const FIELD = {
+	offsetX: "x offset",
+	offsetY: "y offset",
+	fontSize: "size",
+	fontWeight: "weight",
+	fontFamily: "font",
+	lineHeight: "line height",
+	letterSpacing: "letter spacing"
+};
+/** `changed: blur, color` for composite values (shadow, border, typography). */
+function fieldsChanged(a, b) {
+	const layers = (v) => Array.isArray(v) ? v : [v];
+	const la = layers(a);
+	const lb = layers(b);
+	if (la.length !== lb.length) return `${la.length} → ${lb.length} layers`;
+	const fields = /* @__PURE__ */ new Set();
+	la.forEach((x, i) => {
+		const y = lb[i];
+		if (!x || !y || typeof x !== "object" || typeof y !== "object") return;
+		for (const k of /* @__PURE__ */ new Set([...Object.keys(x), ...Object.keys(y)])) if (JSON.stringify(x[k]) !== JSON.stringify(y[k])) fields.add(FIELD[k] ?? k);
+	});
+	return fields.size ? `changed: ${[...fields].join(", ")}` : "";
+}
+const hasValue = (s) => typeof s === "object" && s !== null && "value" in s;
 function formatChangeset(cs, opts = {}) {
 	const format = opts.format ?? "text";
 	if (format === "json") return `${JSON.stringify(opts.impact ? {
@@ -35629,15 +35714,41 @@ function formatChangeset(cs, opts = {}) {
 	} : cs, null, 2)}\n`;
 	const md = format === "markdown";
 	const code = (s) => md ? `\`${s}\`` : s;
+	const cell = (s) => s.replace(/\|/g, "\\|");
 	const types = opts.types ?? /* @__PURE__ */ new Map();
 	const max = opts.maxPropagated ?? 5;
-	const maxSites = opts.maxSites ?? 5;
-	const impactBy = new Map((opts.impact?.changes ?? []).map((ci) => [ci.change, ci]));
+	const maxSites = opts.maxSites ?? 50;
+	const typeOf = (c) => {
+		const side = c.after ?? c.before;
+		return types.get(c.target) ?? (side && typeof side === "object" && "type" in side ? side.type ?? null : null);
+	};
+	/** A side's value; colors in backticks so that GitHub draws a swatch. */
+	const val = (c, side) => {
+		if (!hasValue(side)) return md ? code(formatValue(typeOf(c), side)) : formatValue(typeOf(c), side);
+		if (!md) return formatSide(typeOf(c), side);
+		const raw = side.raw;
+		const alias = typeof raw === "string" && /^\{[^{}]+\}$/.test(raw) ? raw.slice(1, -1) : void 0;
+		return `${code(formatValue(typeOf(c), side.value))}${alias ? ` (from ${code(alias)})` : ""}`;
+	};
+	const name = (c) => `${code(c.target)}${formatWhen(c.when)}`;
 	const propagatedBy = /* @__PURE__ */ new Map();
 	for (const c of cs.changes) for (const cause of c.cause) propagatedBy.set(cause, [...propagatedBy.get(cause) ?? [], c]);
+	const alsoOf = (c) => {
+		const names = [...new Set((propagatedBy.get(c.id) ?? []).map((p) => p.target))];
+		if (!names.length) return "";
+		return `also changes ${names.slice(0, max).map(code).join(", ")}${names.length > max ? ` and ${names.length - max} more` : ""}`;
+	};
 	const listed = cs.changes.filter((c) => !(c.origin === "propagated" && c.cause.length > 0));
-	const shown = !!(opts.focusOnCode && opts.impact) ? listed.filter((c) => impactBy.has(c.id) || c.level === "major") : listed;
+	const reaching = new Set((opts.impact?.changes ?? []).map((ci) => ci.change));
+	const shown = !!(opts.focusOnCode && opts.impact) ? listed.filter((c) => reaching.has(c.id) || c.level === "major") : listed;
 	const hidden = listed.length - shown.length;
+	const byGroup = /* @__PURE__ */ new Map();
+	for (const c of shown) byGroup.set(groupOf(c), [...byGroup.get(groupOf(c)) ?? [], c]);
+	const lines = [];
+	const heading = (text, level) => lines.push(md ? `${"#".repeat(level)} ${text}` : text, "");
+	const title = cs.changes.length === 0 ? "No changes" : TITLE[cs.summary.level];
+	heading(md ? title : `dsgraph diff — ${title}`, 2);
+	lines.push(`${code(formatSource(cs.base.source))} → ${code(formatSource(cs.head.source))}${cs.changes.length ? ` · suggested version: ${md ? `**${cs.summary.level}**` : cs.summary.level}` : ""}`, "", reasonOf(cs), "");
 	const counts = cs.summary.counts;
 	const summary = [
 		counts.removed ? `${counts.removed} removed` : "",
@@ -35646,51 +35757,145 @@ function formatChangeset(cs, opts = {}) {
 		counts.added ? `${counts.added} added` : "",
 		counts.deprecated ? `${counts.deprecated} deprecated` : ""
 	].filter(Boolean);
-	const lines = [];
-	const title = cs.changes.length === 0 ? "no changes" : `suggested bump: ${cs.summary.level}`;
-	if (md) {
-		lines.push(`## dsgraph diff — ${title}`, "");
-		lines.push(`${formatSource(cs.base.source)} → ${formatSource(cs.head.source)}`, "");
-		if (summary.length) lines.push(`**${summary.join(" · ")}**`, "");
-		if (opts.impact) lines.push(impactSummary(opts.impact), "");
-	} else {
-		lines.push(`dsgraph diff — ${title}`, `${formatSource(cs.base.source)} → ${formatSource(cs.head.source)}`);
-		if (summary.length) lines.push(summary.join(" · "));
-		if (opts.impact) lines.push(impactSummary(opts.impact));
-		lines.push("");
-	}
-	for (const level of [
-		"major",
-		"minor",
-		"patch",
-		"none"
-	]) {
-		const group = shown.filter((c) => c.level === level);
-		if (group.length === 0) continue;
-		const collapsible = md && (level === "patch" || level === "none");
-		if (collapsible) lines.push(`<details><summary>${LEVEL_TITLE[level]} (${group.length})</summary>`, "");
-		else lines.push(md ? `### ${LEVEL_TITLE[level]} (${group.length})` : `${LEVEL_TITLE[level]} (${group.length})`, "");
-		for (const c of group) {
-			lines.push(`${md ? "- " : "  "}${describe(c, types, code)}`);
-			const via = propagatedBy.get(c.id);
-			if (via?.length) {
-				const names = [...new Set(via.map((p) => p.target))];
-				const listed = names.slice(0, max).map(code).join(", ");
-				lines.push(`${md ? "  - " : "      "}affects ${listed}${names.length > max ? ` and ${names.length - max} more` : ""}`);
+	if (summary.length) lines.push(summary.join(" · "), "");
+	if (opts.impact) {
+		const impact = opts.impact;
+		heading("In your code", 3);
+		if (impact.breaks === 0 && impact.looksDifferent === 0) lines.push("Nothing in the code uses the changed tokens.", "");
+		else {
+			lines.push(`${[impact.breaks ? `${plural(impact.breaks, "place")} ${impact.breaks === 1 ? "breaks" : "break"}` : "", impact.looksDifferent ? `${plural(impact.looksDifferent, "place")} ${impact.looksDifferent === 1 ? "looks" : "look"} different` : ""].filter(Boolean).join(", ").replace(/^./, (ch) => ch.toUpperCase())} (${plural(impact.files.length, "file")}).`, "");
+			const byChange = new Map(cs.changes.map((c) => [c.id, c]));
+			const rows = /* @__PURE__ */ new Map();
+			for (const ci of impact.changes) {
+				const c = byChange.get(ci.change);
+				for (const site of ci.sites) {
+					const own = site.token === ci.target || c?.kind === "token.renamed" && site.token === c.from;
+					const what = c?.kind === "token.removed" ? `breaks: ${code(ci.target)} was removed${c.possibleRenames?.length ? `, maybe renamed to ${code(c.possibleRenames[0])}` : ""}` : c?.kind === "token.renamed" ? `breaks: renamed to ${code(ci.target)}` : ci.effect === "breaks" ? `breaks: ${code(ci.target)} ${c ? describeKind(c) : "changed"}` : `looks different: ${code(ci.target)} changed${formatWhen(c?.when)}${own ? "" : ` (used through ${code(site.token)})`}`;
+					const key = `${site.file}:${site.line}:${site.column}:${site.text ?? site.name}`;
+					const row = rows.get(key) ?? {
+						site,
+						what: [],
+						breaks: false
+					};
+					row.what.push(what);
+					row.breaks ||= ci.effect === "breaks";
+					rows.set(key, row);
+				}
 			}
-			const ci = impactBy.get(c.id);
-			if (ci) lines.push(`${md ? "  - " : "      "}${sitesLine(ci, maxSites, code)}`);
+			const sorted = [...rows.values()].sort((a, b) => Number(b.breaks) - Number(a.breaks) || a.site.file.localeCompare(b.site.file) || a.site.line - b.site.line);
+			const usesOf = (s) => s.text ?? s.name;
+			const shownRows = sorted.slice(0, maxSites);
+			if (md) {
+				lines.push("| Where | Uses | What happens |", "|---|---|---|");
+				for (const r of shownRows) lines.push(`| ${code(`${r.site.file}:${r.site.line}`)} | ${code(cell(usesOf(r.site)))} | ${cell(joinWhat(r.what))} |`);
+			} else {
+				const width = Math.min(40, Math.max(...shownRows.map((r) => `${r.site.file}:${r.site.line}`.length)));
+				for (const r of shownRows) lines.push(`  ${`${r.site.file}:${r.site.line}`.padEnd(width)}  ${usesOf(r.site)}  ${joinWhat(r.what)}`);
+			}
+			if (sorted.length > maxSites) lines.push("", `…and ${plural(sorted.length - maxSites, "more place")}.`);
+			lines.push("");
 		}
-		lines.push("");
-		if (collapsible) lines.push("</details>", "");
 	}
-	if (hidden) lines.push(`${hidden} other ${hidden === 1 ? "change does" : "changes do"} not reach the code.`, "");
-	if (cs.contexts.partial) lines.push(md ? "> Some contexts were not fully compared (too many permutations)." : "Note: some contexts were not fully compared.", "");
+	const section = (group, render) => {
+		const items = byGroup.get(group);
+		if (!items?.length) return;
+		const quiet = group === "quiet";
+		if (md && quiet) lines.push(`<details><summary>${SECTION[group]} (${items.length})</summary>`, "");
+		else heading(`${SECTION[group]} (${items.length})`, 3);
+		render(items);
+		lines.push("");
+		if (md && quiet) lines.push("</details>", "");
+	};
+	const bullet = md ? "- " : "  ";
+	const sub = md ? "  - " : "      ";
+	section("breaks", (items) => {
+		for (const c of items) {
+			const also = alsoOf(c);
+			switch (c.kind) {
+				case "token.removed": {
+					const was = c.before?.values?.[0];
+					lines.push(`${bullet}${md ? "**Removed**" : "Removed"} ${name(c)}${was ? `, it was ${val(c, was)}` : ""}.${c.possibleRenames?.length ? ` Maybe renamed to ${c.possibleRenames.map(code).join(" or ")}.` : ""}`);
+					break;
+				}
+				case "token.renamed":
+					lines.push(`${bullet}${md ? "**Renamed**" : "Renamed"} ${code(c.from ?? "?")} → ${name(c)}: replace the old name.${c.confidence < 1 ? ` A guess from the same value and a similar name (${Math.round(c.confidence * 100)}%): check it.` : ""}`);
+					break;
+				default: lines.push(`${bullet}${name(c)}: ${describeKind(c)}${hasValue(c.before) || hasValue(c.after) ? `, ${val(c, c.before)} → ${val(c, c.after)}` : ""}.`);
+			}
+			if (also) lines.push(`${sub}${also}`);
+		}
+	});
+	section("looks", (items) => {
+		if (md) {
+			lines.push("| Token | Before | After | Difference |", "|---|---|---|---|");
+			for (const c of items) {
+				const diff = [differenceOf(c), alsoOf(c)].filter(Boolean).join("; ");
+				lines.push(`| ${cell(name(c))} | ${cell(val(c, c.before))} | ${cell(val(c, c.after))} | ${cell(diff)} |`);
+			}
+		} else {
+			const width = Math.min(40, Math.max(...items.map((c) => name(c).length)));
+			for (const c of items) {
+				const diff = [differenceOf(c), alsoOf(c)].filter(Boolean).join("; ");
+				lines.push(`  ${name(c).padEnd(width)}  ${val(c, c.before)} → ${val(c, c.after)}${diff ? `  ${diff}` : ""}`);
+			}
+		}
+	});
+	section("added", (items) => {
+		for (const c of items) {
+			const first = c.after?.values?.[0];
+			lines.push(`${bullet}${name(c)}${first ? ` ${val(c, first)}` : ""}`);
+		}
+	});
+	section("deprecated", (items) => {
+		for (const c of items) {
+			const d = c.after;
+			lines.push(`${bullet}${name(c)}${d?.replacement ? `: use ${code(d.replacement)}` : d?.reason ? `: ${d.reason}` : ""}`);
+		}
+	});
+	section("other", (items) => {
+		for (const c of items) lines.push(`${bullet}${name(c)}: ${describeKind(c)}`);
+	});
+	section("quiet", (items) => {
+		for (const c of items) {
+			const diff = c.kind === "token.value-changed" ? differenceOf(c) : "";
+			lines.push(`${bullet}${name(c)}: ${c.kind === "token.value-changed" ? `${val(c, c.before)} → ${val(c, c.after)}${diff ? ` (${diff})` : ""}` : describeKind(c)}`);
+		}
+	});
+	if (hidden) lines.push(`${plural(hidden, "other change")} ${hidden === 1 ? "does" : "do"} not reach the code.`, "");
+	if (cs.contexts.partial) lines.push(md ? "> Some theme combinations were not compared (too many to compare all)." : "Note: some theme combinations were not compared.", "");
 	return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
-function impactSummary(impact) {
-	if (impact.breaks === 0 && impact.looksDifferent === 0) return "In the code: nothing uses the changed tokens.";
-	return `In the code: ${[impact.breaks ? `${plural(impact.breaks, "place")} ${impact.breaks === 1 ? "breaks" : "break"}` : "", impact.looksDifferent ? `${plural(impact.looksDifferent, "place")} ${impact.looksDifferent === 1 ? "looks" : "look"} different` : ""].filter(Boolean).join(", ")} (${plural(impact.files.length, "file")}).`;
+/** `looks different: a; looks different: b` → `looks different: a; b`. */
+function joinWhat(what) {
+	const out = [];
+	let last = "";
+	for (const w of what) {
+		const [label, ...rest] = w.split(": ");
+		const text = rest.join(": ");
+		out.push(label === last ? text : w);
+		last = label ?? "";
+	}
+	return out.join("; ");
+}
+/** A change kind in words, for lines that have no section of their own. */
+function describeKind(c) {
+	switch (c.kind) {
+		case "token.type-changed": return `type ${String(c.before)} → ${String(c.after)}`;
+		case "token.missing-in-context": return "no longer defined here";
+		case "token.notation-changed": return "same value, written differently";
+		case "token.alias-retargeted": return "references another token with the same value";
+		case "token.contexts-changed": return `depends on other themes: ${JSON.stringify(c.before)} → ${JSON.stringify(c.after)}`;
+		case "token.undeprecated": return "no longer deprecated";
+		case "token.description-changed": return "description changed";
+		case "token.extensions-changed": return "$extensions changed";
+		case "group.extends-changed": return `group $extends ${String(c.before ?? "—")} → ${String(c.after ?? "—")}`;
+		case "context.added": return "theme added";
+		case "context.removed": return "theme removed";
+		case "modifier.added": return "modifier added";
+		case "modifier.removed": return "modifier removed";
+		case "token.value-changed": return "value changed";
+		default: return c.kind;
+	}
 }
 //#endregion
 //#region ../dsgraph-report/dist/findings.js
@@ -35981,6 +36186,7 @@ const deprecatedUsage = {
 				message: `"${u.text ?? u.name}" is deprecated${replacement ? `; use "${replacement}"` : ""}`,
 				nodes: [t.id],
 				evidence: {
+					name: u.text ?? u.name,
 					reason: t.deprecated.reason,
 					replacement,
 					property: u.property
@@ -36004,6 +36210,7 @@ const unknownToken = {
 				message: `"${u.text ?? u.name}" is not a token${u.fallback ? `; the fallback "${u.fallback}" is used instead` : ""}`,
 				nodes: [],
 				evidence: {
+					name: u.text ?? u.name,
 					property: u.property,
 					fallback: u.fallback
 				},
