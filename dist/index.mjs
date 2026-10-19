@@ -4045,6 +4045,145 @@ function validate(schema, value) {
 const validateSnapshot = (value) => validate(Snapshot, value);
 const validateConfig = (value) => validate(Config, value);
 //#endregion
+//#region ../dsgraph-core/dist/knowledge.js
+/**
+* Words dsgraph reads token and file names by. The engine carries a small neutral vocabulary that
+* any front-end developer would write; a knowledge pack (`dsgraph/knowledge@1`) adds to it. The
+* pack is data, not code: the engine works the same without it, with fewer names understood.
+*/
+const DEFAULT_VOCABULARY = {
+	roles: {
+		text: [
+			"fg",
+			"foreground",
+			"text",
+			"ink",
+			"content",
+			"on",
+			"link",
+			"icon"
+		],
+		background: [
+			"bg",
+			"background",
+			"surface",
+			"canvas",
+			"fill",
+			"container",
+			"layer",
+			"backdrop"
+		],
+		border: [
+			"border",
+			"stroke",
+			"outline",
+			"divider",
+			"separator",
+			"ring"
+		],
+		shadow: ["shadow", "elevation"]
+	},
+	states: {
+		hover: "hover",
+		focus: "focus",
+		active: "active",
+		disabled: "disabled",
+		selected: "selected",
+		visited: "visited"
+	},
+	rest: ["rest"],
+	generic: [
+		"index",
+		"style",
+		"styles",
+		"main",
+		"app",
+		"global",
+		"globals",
+		"base",
+		"reset",
+		"util",
+		"utils",
+		"utilities",
+		"common",
+		"shared",
+		"theme",
+		"themes",
+		"tokens",
+		"variables",
+		"vars",
+		"mixins",
+		"snippet",
+		"root",
+		"container",
+		"wrapper",
+		"inner",
+		"src",
+		"lib",
+		"components",
+		"ui",
+		"css",
+		"scss",
+		"sass",
+		"assets",
+		"pages",
+		"views"
+	]
+};
+const ROLES = [
+	"text",
+	"background",
+	"border",
+	"shadow"
+];
+const literal = (w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const words = (list) => list.map((w) => w.toLowerCase());
+function compile(v) {
+	const roles = {};
+	for (const r of ROLES) roles[r] = new RegExp(`(^|\\.)(${words(v.roles[r]).map(literal).join("|")})(\\.|$)`);
+	return {
+		roles,
+		states: new Map(Object.entries(v.states).map(([w, s]) => [w.toLowerCase(), s])),
+		rest: new Set(words(v.rest)),
+		generic: new Set(words(v.generic))
+	};
+}
+const BASE = compile(DEFAULT_VOCABULARY);
+const compiled = /* @__PURE__ */ new WeakMap();
+/** Checks that a value is a knowledge pack dsgraph can read; throws a readable error if not. */
+function readKnowledge(value) {
+	const k = value;
+	if (!k || typeof k !== "object" || k.schema !== "dsgraph/knowledge@1") throw new Error("Not a dsgraph knowledge pack: expected schema \"dsgraph/knowledge@1\"");
+	const v = k.vocabulary ?? {};
+	if (![
+		...Object.values(v.roles ?? {}),
+		v.rest ?? [],
+		v.generic ?? []
+	].every((l) => Array.isArray(l) && l.every((w) => typeof w === "string"))) throw new Error("Knowledge pack: vocabulary lists must be arrays of words");
+	if (!Object.values(v.states ?? {}).every((s) => typeof s === "string")) throw new Error("Knowledge pack: vocabulary.states maps words to state names");
+	return k;
+}
+/** The default vocabulary, with a pack's words added. */
+function vocabularyOf(knowledge) {
+	if (!knowledge?.vocabulary) return BASE;
+	let c = compiled.get(knowledge);
+	if (!c) {
+		const add = knowledge.vocabulary;
+		const d = DEFAULT_VOCABULARY;
+		c = compile({
+			roles: Object.fromEntries(ROLES.map((r) => [r, [...d.roles[r], ...add.roles?.[r] ?? []]])),
+			states: {
+				...d.states,
+				...add.states
+			},
+			rest: [...d.rest, ...add.rest ?? []],
+			generic: [...d.generic, ...add.generic ?? []]
+		});
+		compiled.set(knowledge, c);
+	}
+	return c;
+}
+//#endregion
 //#region ../dsgraph-core/dist/path.js
 /** Token paths, dot-path globs and cross-source name normalization. */
 const tokenId = (path) => path.join(".");
@@ -7882,13 +8021,6 @@ const COMPATIBLE = {
 	number: ["number", "fontWeight"],
 	fontWeight: ["fontWeight", "number"]
 };
-/** What a token is for, by words in its name: text, a background, a border or outline, a shadow. */
-const ROLES = {
-	text: /(^|\.)(fg|foreground|text|ink|content|on|link|icon)(\.|$)/,
-	background: /(^|\.)(bg|background|surface|canvas|fill|container|layer|backdrop)(\.|$)/,
-	border: /(^|\.)(border|stroke|outline|divider|separator|ring)(\.|$)/,
-	shadow: /(^|\.)(shadow|elevation)(\.|$)/
-};
 /** The role a CSS property's value plays: `color` is text, `background-color` a background. */
 function roleOfProperty(property) {
 	const p = property.toLowerCase();
@@ -7897,28 +8029,117 @@ function roleOfProperty(property) {
 	if (/^(border|outline|column-rule)(-(top|right|bottom|left|block|inline)(-(start|end))?)?(-color)?$|^stroke$/.test(p)) return "border";
 	if (/shadow$/.test(p)) return "shadow";
 }
+/** States in a selector; what `:not()` excludes does not count. */
+const SELECTOR_STATES = [
+	[/:hover\b/, "hover"],
+	[/:focus(-visible|-within)?\b/, "focus"],
+	[/:active\b|\[aria-pressed(=["']?true["']?)?\]/, "active"],
+	[/:disabled\b|\[disabled\]|\[aria-disabled(=["']?true["']?)?\]|\.is-disabled\b/, "disabled"],
+	[/:checked\b|\[aria-(selected|checked|current)(=["']?(true|page|step)["']?)?\]|\.is-(selected|checked)\b|\[data-state=["']?(checked|on|active)["']?\]/, "selected"],
+	[/:visited\b/, "visited"]
+];
+/** States of a utility class's variants: `hover:`, `group-focus-visible:`, `aria-disabled:`, `data-[state=checked]:`. */
+function variantStates(source) {
+	const m = /^((?:[\w-]+(?:\[[^\]]*\])?:)*)/.exec(source);
+	const out = /* @__PURE__ */ new Set();
+	for (const v of (m?.[1] ?? "").split(":").filter(Boolean)) if (/hover/.test(v)) out.add("hover");
+	else if (/focus/.test(v)) out.add("focus");
+	else if (/(^|-)active$|pressed/.test(v)) out.add("active");
+	else if (/disabled/.test(v)) out.add("disabled");
+	else if (/checked|selected|current/.test(v)) out.add("selected");
+	else if (/visited/.test(v)) out.add("visited");
+	return [...out];
+}
+const compact = (name) => normalizeName(name).replace(/\./g, "");
+/**
+* The context of a value written in code, for `nearestTokens`: states from the selector or a
+* class's variants, components from the selector's classes (the block of a BEM class) and the file
+* name (`Button.module.css`, `ActionList/Item.tsx`).
+*/
+function styleContext(at, knowledge) {
+	const v = vocabularyOf(knowledge);
+	const states = /* @__PURE__ */ new Set();
+	if (at.selector) {
+		const sel = at.selector.replace(/:not\([^)]*\)/g, "");
+		for (const [re, state] of SELECTOR_STATES) if (re.test(sel)) states.add(state);
+	}
+	if (at.source) for (const s of variantStates(at.source)) states.add(s);
+	const components = /* @__PURE__ */ new Set();
+	const add = (name, isClass) => {
+		const c = compact(name);
+		const words = normalizeName(name).split(".");
+		if (!c || v.generic.has(c) || /^\d/.test(c)) return;
+		if (words.some((w) => v.states.has(w) || v.rest.has(w)) || words[0] === "is" || words[0] === "has") return;
+		if (isClass && Object.values(v.roles).some((re) => re.test(c))) return;
+		components.add(c);
+	};
+	for (const cls of at.selector?.match(/\.-?[_a-zA-Z][\w-]*/g) ?? []) {
+		const name = cls.slice(1);
+		add(name.split(/__|--/)[0], true);
+		if (/__|--/.test(name)) add(name.replace(/--.*$/, ""), true);
+	}
+	const parts = at.file.split("/");
+	const base = parts.at(-1).replace(/(\.(module|styles?|stories|test|spec))*\.[\w]+$/i, "");
+	add(base, false);
+	if (parts.length > 1 && v.generic.has(compact(base))) add(parts.at(-2), false);
+	const ctx = { property: at.property };
+	if (states.size) ctx.states = [...states].sort();
+	if (components.size) ctx.components = [...components];
+	return ctx;
+}
+/** How a token's name fits the code's states: 2 names the state, 1 says nothing, 0 names another state. */
+function stateScore(words, states, v) {
+	const named = new Set(words.map((w) => v.states.get(w)).filter(Boolean));
+	if (states.length) return states.some((s) => named.has(s)) ? 2 : named.size || words.some((w) => v.rest.has(w)) ? 0 : 1;
+	return named.size ? 0 : 1;
+}
+/** Whether a token's name names one of the components: `button` in `button.primary.bgColor`. */
+function componentScore(words, components) {
+	if (!components.length) return 0;
+	for (let i = 0; i < words.length; i++) {
+		let joined = "";
+		for (let j = i; j < Math.min(words.length, i + 4); j++) {
+			joined += words[j];
+			if (components.includes(joined)) return 1;
+		}
+	}
+	return 0;
+}
 const segments = (id) => id.split(".").length;
 /**
 * How well a token's name says it is made for the role: 2 when the name starts with it (`bgColor.*`,
 * a general token), 1 when it says so further on (`selection.bgColor`), -1 when it names another
 * role, else 0.
 */
-function roleScore(id, role) {
+function roleScore(id, role, v) {
 	if (!role) return 0;
 	const name = normalizeName(id);
-	if (ROLES[role].test(name.split(".")[0])) return 2;
-	if (ROLES[role].test(name)) return 1;
-	return Object.keys(ROLES).some((r) => r !== role && ROLES[r].test(name)) ? -1 : 0;
+	const roles = v.roles;
+	if (roles[role].test(name.split(".")[0])) return 2;
+	if (roles[role].test(name)) return 1;
+	return Object.keys(roles).some((r) => r !== role && roles[r].test(name)) ? -1 : 0;
 }
 /**
-* Tokens nearest to a value in one context. Deprecated ones go last. Among exact matches, tokens
-* made for the property's role come first (`fgColor.accent` for `color`, not `borderColor.accent`).
+* Tokens nearest to a value in one context. Deprecated ones go last. Among exact matches, the name
+* decides, in this order:
+* - a token made for another role goes last (`borderColor.accent` for `color`);
+* - the code's state: `control.bgColor.hover` in a `:hover` rule, and in a rule without one, not
+*   a token for hover or disabled;
+* - the code's component: `button.bgColor.rest` in `.button` or `Button.tsx`;
+* - the property's role, as the first part of the name before deeper in it (`fgColor.accent`
+*   before `selection.fgColor`).
 * Among equally close tokens, the ones that reference another token (semantic tokens, which follow
 * themes) come before the primitives that hold the value; then general tokens before component ones
 * (`fgColor.accent` before `button.outline.fgColor.rest`), and the one others build on first.
+* `context` is a CSS property or a whole `StyleContext` (see `styleContext`); a knowledge pack adds
+* to the words names are read by.
 */
-function nearestTokens(graph, parsed, input, limit, property) {
-	const role = property ? roleOfProperty(property) : void 0;
+function nearestTokens(graph, parsed, input, limit, context, knowledge) {
+	const v = vocabularyOf(knowledge);
+	const ctx = typeof context === "string" ? { property: context } : context ?? {};
+	const role = ctx.property ? roleOfProperty(ctx.property) : void 0;
+	const states = ctx.states ?? [];
+	const components = ctx.components ?? [];
 	const types = COMPATIBLE[parsed.type] ?? [parsed.type];
 	const out = [];
 	const depth = /* @__PURE__ */ new Map();
@@ -7937,7 +8158,30 @@ function nearestTokens(graph, parsed, input, limit, property) {
 		out.push(m);
 		depth.set(m, graph.chain(token.id, input).length);
 	}
-	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || (a.exact && b.exact ? roleScore(b.token.id, role) - roleScore(a.token.id, role) : 0) || a.distance - b.distance || Number(depth.get(b) > 1) - Number(depth.get(a) > 1) || segments(a.token.id) - segments(b.token.id) || depth.get(a) - depth.get(b) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
+	const fits = /* @__PURE__ */ new Map();
+	const fit = (m) => {
+		let f = fits.get(m);
+		if (!f) {
+			const words = normalizeName(m.token.id).split(".");
+			const r = roleScore(m.token.id, role, v);
+			f = [
+				r < 0 ? 0 : 1,
+				stateScore(words, states, v),
+				componentScore(words, components),
+				r
+			];
+			fits.set(m, f);
+		}
+		return f;
+	};
+	const byFit = (a, b) => {
+		if (!a.exact || !b.exact) return 0;
+		const fa = fit(a);
+		const fb = fit(b);
+		for (let i = 0; i < fa.length; i++) if (fa[i] !== fb[i]) return fb[i] - fa[i];
+		return 0;
+	};
+	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || byFit(a, b) || a.distance - b.distance || Number(depth.get(b) > 1) - Number(depth.get(a) > 1) || segments(a.token.id) - segments(b.token.id) || depth.get(a) - depth.get(b) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
 }
 //#endregion
 //#region ../dsgraph-core/dist/diagnostics.js
@@ -11518,7 +11762,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.6.3";
+const GENERATOR = "dsgraph@0.7.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -33531,11 +33775,28 @@ function literalsIn(property, value) {
 	}
 	return out;
 }
-function selectorOf(decl) {
-	const parent = decl.parent;
-	return parent && parent.type === "rule" ? parent.selector.replace(/\s+/g, " ") : void 0;
-}
 const WRAP = ".__dsgraph__";
+/**
+* The full selector a declaration applies to, nesting resolved: `&:hover` inside `.button` is
+* `.button:hover`. The wrapper of a declaration list (a `styled` template) is `&`, and a
+* declaration right inside it has no selector.
+*/
+function selectorOf(decl) {
+	const rules = [];
+	for (let p = decl.parent; p && p.type !== "root"; p = p.parent) if (p.type === "rule") rules.unshift(p.selectors);
+	if (!rules.length) return void 0;
+	let full = [""];
+	for (const selectors of rules) {
+		const next = [];
+		for (const outer of full) for (const raw of selectors) {
+			const inner = raw.trim();
+			next.push(!outer ? inner : inner.includes("&") ? inner.replaceAll("&", outer) : `${outer} ${inner}`);
+		}
+		full = next.slice(0, 8);
+	}
+	const out = full.map((s) => s.replaceAll(WRAP, "&").replace(/\s+/g, " ").trim()).join(", ");
+	return out === "&" ? void 0 : out;
+}
 /**
 * Reads CSS text into an index: every `var(--…)` and every color or scale value written by hand.
 * Definitions of custom properties and SCSS variables are where values are named, so their
@@ -33551,8 +33812,7 @@ function scanCssText(file, text, index, opts = {}) {
 			line: (decl.source?.start?.line ?? 1) + offset,
 			column: decl.source?.start?.column ?? 0
 		};
-		const sel = selectorOf(decl);
-		const selector = sel && !sel.includes(WRAP) ? sel : void 0;
+		const selector = selectorOf(decl);
 		const property = decl.prop;
 		for (const v of varsIn(decl.value)) {
 			const use = {
@@ -36206,25 +36466,31 @@ function scaleOf(graph, property, cache) {
 	}
 	return tokens;
 }
-function nearestIn(graph, l, among) {
+function nearestIn(graph, l, knowledge, among) {
 	const all = nearestTokens(graph, {
 		type: l.type,
 		value: l.value
-	}, graph.defaultInput(), among ? 1e4 : 1, l.property);
+	}, graph.defaultInput(), among ? 1e4 : 1, styleContext(l, knowledge), knowledge);
 	return among ? all.find((m) => among.has(m.token.id)) : all[0];
 }
 const hardcodedColor = {
 	id: "style/hardcoded-color",
 	description: "A color in a style is written by hand instead of taken from a token.",
 	defaultSeverity: "warning",
-	run({ graph, code, options, report }) {
+	run({ graph, code, options, knowledge, report }) {
 		if (!code || graph.tokens({ type: "color" }).length === 0) return;
 		const skip = excepted(options);
 		const memo = /* @__PURE__ */ new Map();
 		for (const l of code.literals) {
 			if (l.type !== "color" || skip(l)) continue;
-			const key = `${roleOfProperty(l.property) ?? ""}\u0000${l.text.toLowerCase()}`;
-			if (!memo.has(key)) memo.set(key, nearestIn(graph, l));
+			const { states, components } = styleContext(l, knowledge);
+			const key = [
+				roleOfProperty(l.property),
+				states,
+				components,
+				l.text.toLowerCase()
+			].join("\0");
+			if (!memo.has(key)) memo.set(key, nearestIn(graph, l, knowledge));
 			const near = memo.get(key);
 			if (!near) continue;
 			report({
@@ -36249,14 +36515,14 @@ const offScale = {
 	id: "style/off-scale",
 	description: "A spacing, radius or font size in a style is written by hand: on the scale (use the token) or off it.",
 	defaultSeverity: "warning",
-	run({ graph, code, options, report }) {
+	run({ graph, code, options, knowledge, report }) {
 		if (!code || graph.tokens({ type: "dimension" }).length === 0) return;
 		const skip = excepted(options);
 		const scales = /* @__PURE__ */ new Map();
 		for (const l of code.literals) {
 			if (l.type !== "dimension" || skip(l)) continue;
 			const scale = scaleOf(graph, l.property, scales);
-			const near = nearestIn(graph, l, new Set(scale.map((t) => t.id)));
+			const near = nearestIn(graph, l, knowledge, new Set(scale.map((t) => t.id)));
 			if (!near) continue;
 			if (!near.exact && /radius$/i.test(l.property) && pxOf(l.value) >= 100) continue;
 			const px = near.value;
@@ -36745,6 +37011,7 @@ async function check(graph, config = {}, extraRules = [], opts = {}) {
 				code,
 				vars
 			} : {},
+			...opts.knowledge ? { knowledge: opts.knowledge } : {},
 			report(r) {
 				const f = {
 					rule: rule.id,
@@ -37186,6 +37453,28 @@ function diffOptions(config) {
 	return opts;
 }
 //#endregion
+//#region ../../node_modules/@specsure/knowledge/knowledge.json
+var knowledge_default = {
+	schema: "dsgraph/knowledge@1",
+	version: "0.1.0",
+	vocabulary: {
+		"states": {
+			"hovered": "hover",
+			"focused": "focus",
+			"pressed": "active",
+			"press": "active",
+			"inactive": "disabled",
+			"checked": "selected",
+			"current": "selected"
+		},
+		"rest": [
+			"idle",
+			"normal",
+			"enabled"
+		]
+	}
+};
+//#endregion
 //#region src/run.ts
 const RANK = {
 	none: 0,
@@ -37193,6 +37482,8 @@ const RANK = {
 	minor: 2,
 	major: 3
 };
+/** Specsure's knowledge pack, built into the action (its own license, LICENSE-knowledge). */
+const knowledge = readKnowledge(knowledge_default);
 const MARKER = "<!-- dsgraph-action -->";
 const input = (rt, name, fallback = "") => (rt.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "").trim() || fallback;
 /** Escapes a message for a workflow command (`::error::…`). */
@@ -37299,7 +37590,10 @@ async function run(rt) {
 				pr: pr.number,
 				token
 			});
-			const styles = changed ? (await check(head, config, [], { code })).filter((f) => /^(style|usage)\//.test(f.rule) && f.loc?.file && changed.has(f.loc.file)) : [];
+			const styles = changed ? (await check(head, config, [], {
+				code,
+				knowledge
+			})).filter((f) => /^(style|usage)\//.test(f.rule) && f.loc?.file && changed.has(f.loc.file)) : [];
 			if (styles.length) body += stylesSection(styles);
 		}
 		if (code) {
@@ -37307,7 +37601,7 @@ async function run(rt) {
 			body += `\n${formatCoverage(coverageOf(code, vars))}\n`;
 		}
 		if (input(rt, "checks", pkg ? "false" : "true") !== "false") {
-			const findings = await check(head, config);
+			const findings = await check(head, config, [], { knowledge });
 			if (findings.length) body += `\n<details><summary>Checks on the new version (${findings.length})</summary>\n\n${formatFindings(findings, { format: "markdown" })}\n</details>\n`;
 		}
 		body += "\n<sub>[dsgraph](https://github.com/specsure/specsure) · design tokens compared as a graph</sub>\n";

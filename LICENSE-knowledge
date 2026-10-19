@@ -1,0 +1,18 @@
+Specsure knowledge pack — license (DRAFT, not reviewed by a lawyer)
+
+Copyright (c) 2026 Adam Reznik. All rights reserved.
+
+This package ("the Pack") is data, not software, and is not covered by the MIT license of dsgraph.
+
+You may use the Pack, free of charge, only together with dsgraph (the @dsgraph/* packages, the
+dsgraph CLI, MCP server and GitHub Action), in any project, commercial or not.
+
+You may not:
+- distribute the Pack, or any part or derivative of it, on its own or with software other than
+  dsgraph;
+- use the Pack, or output produced mainly to extract it, to build, train, tune or evaluate other
+  tools, datasets or models;
+- remove this notice.
+
+The Pack is provided "as is", without warranty of any kind. In no event shall the author be liable
+for any claim, damages or other liability arising from the Pack or its use.
