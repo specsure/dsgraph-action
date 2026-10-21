@@ -4092,6 +4092,34 @@ const DEFAULT_VOCABULARY = {
 		visited: "visited"
 	},
 	rest: ["rest"],
+	defaults: ["default"],
+	layers: {
+		palette: [
+			"primitive",
+			"primitives",
+			"palette",
+			"palettes",
+			"ref",
+			"reference",
+			"core",
+			"global",
+			"foundation",
+			"foundations"
+		],
+		semantic: [
+			"semantic",
+			"semantics",
+			"sys",
+			"alias",
+			"aliases"
+		],
+		component: [
+			"component",
+			"components",
+			"comp",
+			"cmp"
+		]
+	},
 	generic: [
 		"index",
 		"style",
@@ -4136,6 +4164,11 @@ const ROLES = [
 	"border",
 	"shadow"
 ];
+const LAYERS = [
+	"palette",
+	"semantic",
+	"component"
+];
 const literal = (w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const words = (list) => list.map((w) => w.toLowerCase());
 function compile(v) {
@@ -4145,6 +4178,8 @@ function compile(v) {
 		roles,
 		states: new Map(Object.entries(v.states).map(([w, s]) => [w.toLowerCase(), s])),
 		rest: new Set(words(v.rest)),
+		defaults: new Set(words(v.defaults)),
+		layers: new Map(LAYERS.flatMap((l) => words(v.layers[l]).map((w) => [w, l]))),
 		generic: new Set(words(v.generic))
 	};
 }
@@ -4158,6 +4193,8 @@ function readKnowledge(value) {
 	if (![
 		...Object.values(v.roles ?? {}),
 		v.rest ?? [],
+		v.defaults ?? [],
+		...Object.values(v.layers ?? {}),
 		v.generic ?? []
 	].every((l) => Array.isArray(l) && l.every((w) => typeof w === "string"))) throw new Error("Knowledge pack: vocabulary lists must be arrays of words");
 	if (!Object.values(v.states ?? {}).every((s) => typeof s === "string")) throw new Error("Knowledge pack: vocabulary.states maps words to state names");
@@ -4177,6 +4214,8 @@ function vocabularyOf(knowledge) {
 				...add.states
 			},
 			rest: [...d.rest, ...add.rest ?? []],
+			defaults: [...d.defaults, ...add.defaults ?? []],
+			layers: Object.fromEntries(LAYERS.map((l) => [l, [...d.layers[l], ...add.layers?.[l] ?? []]])),
 			generic: [...d.generic, ...add.generic ?? []]
 		});
 		compiled.set(knowledge, c);
@@ -4474,16 +4513,16 @@ const parseHex = (color) => {
 };
 //#endregion
 //#region ../../node_modules/culori/src/util/regex.js
-const num$1 = "([+-]?\\d*\\.?\\d+(?:[eE][+-]?\\d+)?)";
-const per = `${num$1}%`;
-const num_per = `(?:${num$1}%|${num$1})`;
-const num_per_none = `(?:${num$1}%|${num$1}|none)`;
-const hue$1 = `(?:${num$1}(deg|grad|rad|turn)|${num$1})`;
+const num$2 = "([+-]?\\d*\\.?\\d+(?:[eE][+-]?\\d+)?)";
+const per = `${num$2}%`;
+const num_per = `(?:${num$2}%|${num$2})`;
+const num_per_none = `(?:${num$2}%|${num$2}|none)`;
+const hue$1 = `(?:${num$2}(deg|grad|rad|turn)|${num$2})`;
 const c = `\\s*,\\s*`;
 new RegExp("^" + num_per_none + "$");
 //#endregion
 //#region ../../node_modules/culori/src/rgb/parseRgbLegacy.js
-const rgb_num_old = new RegExp(`^rgba?\\(\\s*${num$1}${c}${num$1}${c}${num$1}\\s*(?:,\\s*${num_per}\\s*)?\\)$`);
+const rgb_num_old = new RegExp(`^rgba?\\(\\s*${num$2}${c}${num$2}${c}${num$2}\\s*(?:,\\s*${num_per}\\s*)?\\)$`);
 const rgb_per_old = new RegExp(`^rgba?\\(\\s*${per}${c}${per}${c}${per}\\s*(?:,\\s*${num_per}\\s*)?\\)$`);
 const parseRgbLegacy = (color) => {
 	let res = { mode: "rgb" };
@@ -4589,7 +4628,7 @@ const huenits = {
 	grad: 9 / 10,
 	turn: 360
 };
-function num(chars) {
+function num$1(chars) {
 	let value = "";
 	if (chars[_i] === "-" || chars[_i] === "+") value += chars[_i++];
 	value += digits(chars);
@@ -4665,7 +4704,7 @@ function tokenize(str = "") {
 		if (ch === "+") {
 			_i--;
 			if (is_num(chars)) {
-				tokens.push(num(chars));
+				tokens.push(num$1(chars));
 				continue;
 			}
 			return;
@@ -4673,7 +4712,7 @@ function tokenize(str = "") {
 		if (ch === "-") {
 			_i--;
 			if (is_num(chars)) {
-				tokens.push(num(chars));
+				tokens.push(num$1(chars));
 				continue;
 			}
 			if (is_ident(chars)) {
@@ -4688,7 +4727,7 @@ function tokenize(str = "") {
 		if (ch === ".") {
 			_i--;
 			if (is_num(chars)) {
-				tokens.push(num(chars));
+				tokens.push(num$1(chars));
 				continue;
 			}
 			return;
@@ -4697,7 +4736,7 @@ function tokenize(str = "") {
 			while (_i < chars.length && (chars[_i] === "\n" || chars[_i] === "	" || chars[_i] === " ")) _i++;
 			let alpha;
 			if (is_num(chars)) {
-				alpha = num(chars);
+				alpha = num$1(chars);
 				if (alpha.type !== Tok.Hue) {
 					tokens.push({
 						type: Tok.Alpha,
@@ -4722,7 +4761,7 @@ function tokenize(str = "") {
 		}
 		if (/\d/.test(ch)) {
 			_i--;
-			tokens.push(num(chars));
+			tokens.push(num$1(chars));
 			continue;
 		}
 		if (IdentStartCodePoint.test(ch)) {
@@ -8105,7 +8144,8 @@ function componentScore(words, components) {
 	}
 	return 0;
 }
-const segments = (id) => id.split(".").length;
+/** Words in a name, whatever separates them: `bgColor.accent` and `bgColor-accent` both have three. */
+const segments = (id) => normalizeName(id).split(".").length;
 /**
 * How well a token's name says it is made for the role: 2 when the name starts with it (`bgColor.*`,
 * a general token), 1 when it says so further on (`selection.bgColor`), -1 when it names another
@@ -8130,7 +8170,8 @@ function roleScore(id, role, v) {
 *   before `selection.fgColor`).
 * Among equally close tokens, the ones that reference another token (semantic tokens, which follow
 * themes) come before the primitives that hold the value; then general tokens before component ones
-* (`fgColor.accent` before `button.outline.fgColor.rest`), and the one others build on first.
+* (`fgColor.accent` before `button.outline.fgColor.rest`), the one the system names its default
+* (`bg.default` before `bg.raised`), the one others build on first, then the one more tokens reference.
 * `context` is a CSS property or a whole `StyleContext` (see `styleContext`); a knowledge pack adds
 * to the words names are read by.
 */
@@ -8174,6 +8215,16 @@ function nearestTokens(graph, parsed, input, limit, context, knowledge) {
 		}
 		return f;
 	};
+	const used = /* @__PURE__ */ new Map();
+	const users = (m) => {
+		let n = used.get(m);
+		if (n === void 0) {
+			n = graph.dependents(m.token.id).length;
+			used.set(m, n);
+		}
+		return n;
+	};
+	const named = (m) => Number(normalizeName(m.token.id).split(".").some((w) => v.defaults.has(w)));
 	const byFit = (a, b) => {
 		if (!a.exact || !b.exact) return 0;
 		const fa = fit(a);
@@ -8181,7 +8232,7 @@ function nearestTokens(graph, parsed, input, limit, context, knowledge) {
 		for (let i = 0; i < fa.length; i++) if (fa[i] !== fb[i]) return fb[i] - fa[i];
 		return 0;
 	};
-	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || byFit(a, b) || a.distance - b.distance || Number(depth.get(b) > 1) - Number(depth.get(a) > 1) || segments(a.token.id) - segments(b.token.id) || depth.get(a) - depth.get(b) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
+	return out.sort((a, b) => Number(a.token.deprecated !== null) - Number(b.token.deprecated !== null) || byFit(a, b) || a.distance - b.distance || Number(depth.get(b) > 1) - Number(depth.get(a) > 1) || segments(a.token.id) - segments(b.token.id) || named(b) - named(a) || depth.get(a) - depth.get(b) || users(b) - users(a) || a.token.id.localeCompare(b.token.id)).slice(0, limit);
 }
 //#endregion
 //#region ../dsgraph-core/dist/diagnostics.js
@@ -11540,6 +11591,126 @@ function stripJsonc(text) {
 	return out.replace(/,(\s*[}\]])/g, "$1");
 }
 //#endregion
+//#region ../dsgraph-core/dist/layers.js
+const RANK$2 = {
+	value: 0,
+	palette: 0,
+	semantic: 1,
+	component: 2
+};
+/** Words that only repeat the type before the part of a name that matters: `color.text.body`. */
+const TYPE_WORDS = /* @__PURE__ */ new Set([
+	"color",
+	"colors",
+	"colour",
+	"dimension",
+	"size",
+	"semantic",
+	"sys",
+	"ref"
+]);
+/** Whole-value references of a token in any of its contexts. */
+const targets = (graph, id) => [...new Set((graph.token(id)?.values ?? []).flatMap((v) => v.refs.filter((r) => !r.property && !r.targetPath).map((r) => r.to)))];
+const computed = /* @__PURE__ */ new WeakMap();
+/**
+* Every token's layer and the references that go against the layers. Layers set in the config
+* win, then the names the system gives its groups, collections and files; the rest is read from
+* references, and only then is a component told from a semantic token by its name: a component's
+* name leads with the component (`card.bg`, `button.text`), a semantic one with what it is for.
+*/
+function inferLayers(graph, knowledge) {
+	const cached = knowledge ? void 0 : computed.get(graph);
+	if (cached) return cached;
+	const v = vocabularyOf(knowledge);
+	const roleOrState = (w) => v.states.has(w) || Object.values(v.roles).some((r) => r.test(w));
+	const named = (id) => {
+		const t = graph.token(id);
+		const configured = t.layer ? v.layers.get(t.layer.toLowerCase()) : void 0;
+		if (configured) return configured;
+		const words = normalizeName(id).split(".");
+		const lead = [words[0]];
+		if (words[0].length <= 3 && !roleOrState(words[0]) && words[1]) lead.push(words[1]);
+		for (const w of lead) {
+			const l = v.layers.get(w);
+			if (l) return l;
+		}
+		const lead0 = words.length > 1 && TYPE_WORDS.has(words[0]) ? words[1] : words[0];
+		const raw = targets(graph, id).every((to) => !targets(graph, to).length);
+		const file = t.origin.file.toLowerCase().split(/[/\\]/);
+		const parts = file.flatMap((p, i) => i === file.length - 1 ? [p.split(".")[0]] : [p]);
+		for (const p of parts) for (const w of p.split(/[^a-z0-9]+/)) {
+			const l = v.layers.get(w);
+			if (l && (l !== "palette" || raw && !roleOrState(lead0))) return l;
+		}
+	};
+	const component = (id) => {
+		const words = normalizeName(id).split(".");
+		const at = words.length > 1 && TYPE_WORDS.has(words[0]) ? 1 : 0;
+		const lead = words[at];
+		if (!lead || roleOrState(lead) || /^\d/.test(lead)) return false;
+		return words.slice(at + 1).some((w) => Object.values(v.roles).some((r) => r.test(w)));
+	};
+	const tokens = /* @__PURE__ */ new Map();
+	for (const t of graph.tokens()) {
+		const fromConfig = !!t.layer && !!v.layers.get(t.layer.toLowerCase());
+		const name = named(t.id);
+		if (name) {
+			tokens.set(t.id, {
+				layer: name,
+				by: fromConfig ? "config" : "name"
+			});
+			continue;
+		}
+		const layer = targets(graph, t.id).length ? component(t.id) ? "component" : "semantic" : graph.dependents(t.id).length ? "palette" : "value";
+		tokens.set(t.id, {
+			layer,
+			by: "references"
+		});
+	}
+	const groups = /* @__PURE__ */ new Map();
+	for (const id of tokens.keys()) {
+		const g = id.replace(/[.-][^.-]+$/, "");
+		if (g !== id) groups.set(g, [...groups.get(g) ?? [], id]);
+	}
+	for (const [, ids] of groups) {
+		const steps = ids.filter((id) => /[.-][a-z]?\d+$/.test(id) && graph.token(id).type === "color" && !targets(graph, id).length);
+		const ramp = new Set(steps.length >= 3 ? steps : []);
+		const palette = ids.filter((id) => ramp.has(id) || tokens.get(id).layer === "palette").length;
+		for (const id of ids) {
+			const l = tokens.get(id);
+			if (l.by !== "references" || l.layer === "palette" || l.layer === "component") continue;
+			if (l.layer === "semantic" && !targets(graph, id).every((to) => tokens.get(to)?.layer === "palette")) continue;
+			if (ramp.has(id) || ids.length >= 3 && palette * 2 > ids.length - 1) tokens.set(id, {
+				layer: "palette",
+				by: "references"
+			});
+		}
+	}
+	const has = new Set([...tokens.values()].map((x) => x.layer));
+	const crossings = [];
+	for (const [from, f] of tokens) {
+		if (f.by === "config") continue;
+		for (const to of targets(graph, from)) {
+			const t = tokens.get(to);
+			if (!t) continue;
+			const kind = f.layer === "component" && (t.layer === "palette" || t.layer === "value") && has.has("semantic") ? "skips-semantic" : RANK$2[t.layer] > RANK$2[f.layer] ? "upward" : void 0;
+			if (kind) crossings.push({
+				from,
+				to,
+				fromLayer: f.layer,
+				toLayer: t.layer,
+				kind
+			});
+		}
+	}
+	const out = {
+		tokens,
+		crossings
+	};
+	if (!knowledge) computed.set(graph, out);
+	return out;
+}
+//#endregion
 //#region ../dsgraph-core/dist/not-tokens.js
 /**
 * JSON files that are never token files, skipped when looking through all `*.json`.
@@ -11762,7 +11933,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.7.0";
+const GENERATOR = "dsgraph@0.8.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -33873,6 +34044,1587 @@ function scanSassText(file, text, index, opts = {}) {
 	});
 }
 //#endregion
+//#region ../dsgraph-adapters/dist/tailwind-palette.js
+/**
+* Tailwind's default color palette, for classes such as `bg-blue-500` that a project uses without
+* defining in its own theme: the color Tailwind writes for them. Taken from tailwindcss 3.4.17
+* (`lib/public/colors.js`, hex) and 4.1.11 (`theme.css`, OKLCH); MIT License, Copyright (c)
+* Tailwind Labs, Inc.
+*/
+const STEPS = [
+	50,
+	100,
+	200,
+	300,
+	400,
+	500,
+	600,
+	700,
+	800,
+	900,
+	950
+];
+/** Tailwind 3: hex. */
+const TAILWIND_3 = {
+	red: [
+		"#fef2f2",
+		"#fee2e2",
+		"#fecaca",
+		"#fca5a5",
+		"#f87171",
+		"#ef4444",
+		"#dc2626",
+		"#b91c1c",
+		"#991b1b",
+		"#7f1d1d",
+		"#450a0a"
+	],
+	orange: [
+		"#fff7ed",
+		"#ffedd5",
+		"#fed7aa",
+		"#fdba74",
+		"#fb923c",
+		"#f97316",
+		"#ea580c",
+		"#c2410c",
+		"#9a3412",
+		"#7c2d12",
+		"#431407"
+	],
+	amber: [
+		"#fffbeb",
+		"#fef3c7",
+		"#fde68a",
+		"#fcd34d",
+		"#fbbf24",
+		"#f59e0b",
+		"#d97706",
+		"#b45309",
+		"#92400e",
+		"#78350f",
+		"#451a03"
+	],
+	yellow: [
+		"#fefce8",
+		"#fef9c3",
+		"#fef08a",
+		"#fde047",
+		"#facc15",
+		"#eab308",
+		"#ca8a04",
+		"#a16207",
+		"#854d0e",
+		"#713f12",
+		"#422006"
+	],
+	lime: [
+		"#f7fee7",
+		"#ecfccb",
+		"#d9f99d",
+		"#bef264",
+		"#a3e635",
+		"#84cc16",
+		"#65a30d",
+		"#4d7c0f",
+		"#3f6212",
+		"#365314",
+		"#1a2e05"
+	],
+	green: [
+		"#f0fdf4",
+		"#dcfce7",
+		"#bbf7d0",
+		"#86efac",
+		"#4ade80",
+		"#22c55e",
+		"#16a34a",
+		"#15803d",
+		"#166534",
+		"#14532d",
+		"#052e16"
+	],
+	emerald: [
+		"#ecfdf5",
+		"#d1fae5",
+		"#a7f3d0",
+		"#6ee7b7",
+		"#34d399",
+		"#10b981",
+		"#059669",
+		"#047857",
+		"#065f46",
+		"#064e3b",
+		"#022c22"
+	],
+	teal: [
+		"#f0fdfa",
+		"#ccfbf1",
+		"#99f6e4",
+		"#5eead4",
+		"#2dd4bf",
+		"#14b8a6",
+		"#0d9488",
+		"#0f766e",
+		"#115e59",
+		"#134e4a",
+		"#042f2e"
+	],
+	cyan: [
+		"#ecfeff",
+		"#cffafe",
+		"#a5f3fc",
+		"#67e8f9",
+		"#22d3ee",
+		"#06b6d4",
+		"#0891b2",
+		"#0e7490",
+		"#155e75",
+		"#164e63",
+		"#083344"
+	],
+	sky: [
+		"#f0f9ff",
+		"#e0f2fe",
+		"#bae6fd",
+		"#7dd3fc",
+		"#38bdf8",
+		"#0ea5e9",
+		"#0284c7",
+		"#0369a1",
+		"#075985",
+		"#0c4a6e",
+		"#082f49"
+	],
+	blue: [
+		"#eff6ff",
+		"#dbeafe",
+		"#bfdbfe",
+		"#93c5fd",
+		"#60a5fa",
+		"#3b82f6",
+		"#2563eb",
+		"#1d4ed8",
+		"#1e40af",
+		"#1e3a8a",
+		"#172554"
+	],
+	indigo: [
+		"#eef2ff",
+		"#e0e7ff",
+		"#c7d2fe",
+		"#a5b4fc",
+		"#818cf8",
+		"#6366f1",
+		"#4f46e5",
+		"#4338ca",
+		"#3730a3",
+		"#312e81",
+		"#1e1b4b"
+	],
+	violet: [
+		"#f5f3ff",
+		"#ede9fe",
+		"#ddd6fe",
+		"#c4b5fd",
+		"#a78bfa",
+		"#8b5cf6",
+		"#7c3aed",
+		"#6d28d9",
+		"#5b21b6",
+		"#4c1d95",
+		"#2e1065"
+	],
+	purple: [
+		"#faf5ff",
+		"#f3e8ff",
+		"#e9d5ff",
+		"#d8b4fe",
+		"#c084fc",
+		"#a855f7",
+		"#9333ea",
+		"#7e22ce",
+		"#6b21a8",
+		"#581c87",
+		"#3b0764"
+	],
+	fuchsia: [
+		"#fdf4ff",
+		"#fae8ff",
+		"#f5d0fe",
+		"#f0abfc",
+		"#e879f9",
+		"#d946ef",
+		"#c026d3",
+		"#a21caf",
+		"#86198f",
+		"#701a75",
+		"#4a044e"
+	],
+	pink: [
+		"#fdf2f8",
+		"#fce7f3",
+		"#fbcfe8",
+		"#f9a8d4",
+		"#f472b6",
+		"#ec4899",
+		"#db2777",
+		"#be185d",
+		"#9d174d",
+		"#831843",
+		"#500724"
+	],
+	rose: [
+		"#fff1f2",
+		"#ffe4e6",
+		"#fecdd3",
+		"#fda4af",
+		"#fb7185",
+		"#f43f5e",
+		"#e11d48",
+		"#be123c",
+		"#9f1239",
+		"#881337",
+		"#4c0519"
+	],
+	slate: [
+		"#f8fafc",
+		"#f1f5f9",
+		"#e2e8f0",
+		"#cbd5e1",
+		"#94a3b8",
+		"#64748b",
+		"#475569",
+		"#334155",
+		"#1e293b",
+		"#0f172a",
+		"#020617"
+	],
+	gray: [
+		"#f9fafb",
+		"#f3f4f6",
+		"#e5e7eb",
+		"#d1d5db",
+		"#9ca3af",
+		"#6b7280",
+		"#4b5563",
+		"#374151",
+		"#1f2937",
+		"#111827",
+		"#030712"
+	],
+	zinc: [
+		"#fafafa",
+		"#f4f4f5",
+		"#e4e4e7",
+		"#d4d4d8",
+		"#a1a1aa",
+		"#71717a",
+		"#52525b",
+		"#3f3f46",
+		"#27272a",
+		"#18181b",
+		"#09090b"
+	],
+	neutral: [
+		"#fafafa",
+		"#f5f5f5",
+		"#e5e5e5",
+		"#d4d4d4",
+		"#a3a3a3",
+		"#737373",
+		"#525252",
+		"#404040",
+		"#262626",
+		"#171717",
+		"#0a0a0a"
+	],
+	stone: [
+		"#fafaf9",
+		"#f5f5f4",
+		"#e7e5e4",
+		"#d6d3d1",
+		"#a8a29e",
+		"#78716c",
+		"#57534e",
+		"#44403c",
+		"#292524",
+		"#1c1917",
+		"#0c0a09"
+	]
+};
+/** Tailwind 4: `oklch(L% C H)`, kept as L, C, H. */
+const TAILWIND_4 = {
+	red: [
+		[
+			97.1,
+			.013,
+			17.38
+		],
+		[
+			93.6,
+			.032,
+			17.717
+		],
+		[
+			88.5,
+			.062,
+			18.334
+		],
+		[
+			80.8,
+			.114,
+			19.571
+		],
+		[
+			70.4,
+			.191,
+			22.216
+		],
+		[
+			63.7,
+			.237,
+			25.331
+		],
+		[
+			57.7,
+			.245,
+			27.325
+		],
+		[
+			50.5,
+			.213,
+			27.518
+		],
+		[
+			44.4,
+			.177,
+			26.899
+		],
+		[
+			39.6,
+			.141,
+			25.723
+		],
+		[
+			25.8,
+			.092,
+			26.042
+		]
+	],
+	orange: [
+		[
+			98,
+			.016,
+			73.684
+		],
+		[
+			95.4,
+			.038,
+			75.164
+		],
+		[
+			90.1,
+			.076,
+			70.697
+		],
+		[
+			83.7,
+			.128,
+			66.29
+		],
+		[
+			75,
+			.183,
+			55.934
+		],
+		[
+			70.5,
+			.213,
+			47.604
+		],
+		[
+			64.6,
+			.222,
+			41.116
+		],
+		[
+			55.3,
+			.195,
+			38.402
+		],
+		[
+			47,
+			.157,
+			37.304
+		],
+		[
+			40.8,
+			.123,
+			38.172
+		],
+		[
+			26.6,
+			.079,
+			36.259
+		]
+	],
+	amber: [
+		[
+			98.7,
+			.022,
+			95.277
+		],
+		[
+			96.2,
+			.059,
+			95.617
+		],
+		[
+			92.4,
+			.12,
+			95.746
+		],
+		[
+			87.9,
+			.169,
+			91.605
+		],
+		[
+			82.8,
+			.189,
+			84.429
+		],
+		[
+			76.9,
+			.188,
+			70.08
+		],
+		[
+			66.6,
+			.179,
+			58.318
+		],
+		[
+			55.5,
+			.163,
+			48.998
+		],
+		[
+			47.3,
+			.137,
+			46.201
+		],
+		[
+			41.4,
+			.112,
+			45.904
+		],
+		[
+			27.9,
+			.077,
+			45.635
+		]
+	],
+	yellow: [
+		[
+			98.7,
+			.026,
+			102.212
+		],
+		[
+			97.3,
+			.071,
+			103.193
+		],
+		[
+			94.5,
+			.129,
+			101.54
+		],
+		[
+			90.5,
+			.182,
+			98.111
+		],
+		[
+			85.2,
+			.199,
+			91.936
+		],
+		[
+			79.5,
+			.184,
+			86.047
+		],
+		[
+			68.1,
+			.162,
+			75.834
+		],
+		[
+			55.4,
+			.135,
+			66.442
+		],
+		[
+			47.6,
+			.114,
+			61.907
+		],
+		[
+			42.1,
+			.095,
+			57.708
+		],
+		[
+			28.6,
+			.066,
+			53.813
+		]
+	],
+	lime: [
+		[
+			98.6,
+			.031,
+			120.757
+		],
+		[
+			96.7,
+			.067,
+			122.328
+		],
+		[
+			93.8,
+			.127,
+			124.321
+		],
+		[
+			89.7,
+			.196,
+			126.665
+		],
+		[
+			84.1,
+			.238,
+			128.85
+		],
+		[
+			76.8,
+			.233,
+			130.85
+		],
+		[
+			64.8,
+			.2,
+			131.684
+		],
+		[
+			53.2,
+			.157,
+			131.589
+		],
+		[
+			45.3,
+			.124,
+			130.933
+		],
+		[
+			40.5,
+			.101,
+			131.063
+		],
+		[
+			27.4,
+			.072,
+			132.109
+		]
+	],
+	green: [
+		[
+			98.2,
+			.018,
+			155.826
+		],
+		[
+			96.2,
+			.044,
+			156.743
+		],
+		[
+			92.5,
+			.084,
+			155.995
+		],
+		[
+			87.1,
+			.15,
+			154.449
+		],
+		[
+			79.2,
+			.209,
+			151.711
+		],
+		[
+			72.3,
+			.219,
+			149.579
+		],
+		[
+			62.7,
+			.194,
+			149.214
+		],
+		[
+			52.7,
+			.154,
+			150.069
+		],
+		[
+			44.8,
+			.119,
+			151.328
+		],
+		[
+			39.3,
+			.095,
+			152.535
+		],
+		[
+			26.6,
+			.065,
+			152.934
+		]
+	],
+	emerald: [
+		[
+			97.9,
+			.021,
+			166.113
+		],
+		[
+			95,
+			.052,
+			163.051
+		],
+		[
+			90.5,
+			.093,
+			164.15
+		],
+		[
+			84.5,
+			.143,
+			164.978
+		],
+		[
+			76.5,
+			.177,
+			163.223
+		],
+		[
+			69.6,
+			.17,
+			162.48
+		],
+		[
+			59.6,
+			.145,
+			163.225
+		],
+		[
+			50.8,
+			.118,
+			165.612
+		],
+		[
+			43.2,
+			.095,
+			166.913
+		],
+		[
+			37.8,
+			.077,
+			168.94
+		],
+		[
+			26.2,
+			.051,
+			172.552
+		]
+	],
+	teal: [
+		[
+			98.4,
+			.014,
+			180.72
+		],
+		[
+			95.3,
+			.051,
+			180.801
+		],
+		[
+			91,
+			.096,
+			180.426
+		],
+		[
+			85.5,
+			.138,
+			181.071
+		],
+		[
+			77.7,
+			.152,
+			181.912
+		],
+		[
+			70.4,
+			.14,
+			182.503
+		],
+		[
+			60,
+			.118,
+			184.704
+		],
+		[
+			51.1,
+			.096,
+			186.391
+		],
+		[
+			43.7,
+			.078,
+			188.216
+		],
+		[
+			38.6,
+			.063,
+			188.416
+		],
+		[
+			27.7,
+			.046,
+			192.524
+		]
+	],
+	cyan: [
+		[
+			98.4,
+			.019,
+			200.873
+		],
+		[
+			95.6,
+			.045,
+			203.388
+		],
+		[
+			91.7,
+			.08,
+			205.041
+		],
+		[
+			86.5,
+			.127,
+			207.078
+		],
+		[
+			78.9,
+			.154,
+			211.53
+		],
+		[
+			71.5,
+			.143,
+			215.221
+		],
+		[
+			60.9,
+			.126,
+			221.723
+		],
+		[
+			52,
+			.105,
+			223.128
+		],
+		[
+			45,
+			.085,
+			224.283
+		],
+		[
+			39.8,
+			.07,
+			227.392
+		],
+		[
+			30.2,
+			.056,
+			229.695
+		]
+	],
+	sky: [
+		[
+			97.7,
+			.013,
+			236.62
+		],
+		[
+			95.1,
+			.026,
+			236.824
+		],
+		[
+			90.1,
+			.058,
+			230.902
+		],
+		[
+			82.8,
+			.111,
+			230.318
+		],
+		[
+			74.6,
+			.16,
+			232.661
+		],
+		[
+			68.5,
+			.169,
+			237.323
+		],
+		[
+			58.8,
+			.158,
+			241.966
+		],
+		[
+			50,
+			.134,
+			242.749
+		],
+		[
+			44.3,
+			.11,
+			240.79
+		],
+		[
+			39.1,
+			.09,
+			240.876
+		],
+		[
+			29.3,
+			.066,
+			243.157
+		]
+	],
+	blue: [
+		[
+			97,
+			.014,
+			254.604
+		],
+		[
+			93.2,
+			.032,
+			255.585
+		],
+		[
+			88.2,
+			.059,
+			254.128
+		],
+		[
+			80.9,
+			.105,
+			251.813
+		],
+		[
+			70.7,
+			.165,
+			254.624
+		],
+		[
+			62.3,
+			.214,
+			259.815
+		],
+		[
+			54.6,
+			.245,
+			262.881
+		],
+		[
+			48.8,
+			.243,
+			264.376
+		],
+		[
+			42.4,
+			.199,
+			265.638
+		],
+		[
+			37.9,
+			.146,
+			265.522
+		],
+		[
+			28.2,
+			.091,
+			267.935
+		]
+	],
+	indigo: [
+		[
+			96.2,
+			.018,
+			272.314
+		],
+		[
+			93,
+			.034,
+			272.788
+		],
+		[
+			87,
+			.065,
+			274.039
+		],
+		[
+			78.5,
+			.115,
+			274.713
+		],
+		[
+			67.3,
+			.182,
+			276.935
+		],
+		[
+			58.5,
+			.233,
+			277.117
+		],
+		[
+			51.1,
+			.262,
+			276.966
+		],
+		[
+			45.7,
+			.24,
+			277.023
+		],
+		[
+			39.8,
+			.195,
+			277.366
+		],
+		[
+			35.9,
+			.144,
+			278.697
+		],
+		[
+			25.7,
+			.09,
+			281.288
+		]
+	],
+	violet: [
+		[
+			96.9,
+			.016,
+			293.756
+		],
+		[
+			94.3,
+			.029,
+			294.588
+		],
+		[
+			89.4,
+			.057,
+			293.283
+		],
+		[
+			81.1,
+			.111,
+			293.571
+		],
+		[
+			70.2,
+			.183,
+			293.541
+		],
+		[
+			60.6,
+			.25,
+			292.717
+		],
+		[
+			54.1,
+			.281,
+			293.009
+		],
+		[
+			49.1,
+			.27,
+			292.581
+		],
+		[
+			43.2,
+			.232,
+			292.759
+		],
+		[
+			38,
+			.189,
+			293.745
+		],
+		[
+			28.3,
+			.141,
+			291.089
+		]
+	],
+	purple: [
+		[
+			97.7,
+			.014,
+			308.299
+		],
+		[
+			94.6,
+			.033,
+			307.174
+		],
+		[
+			90.2,
+			.063,
+			306.703
+		],
+		[
+			82.7,
+			.119,
+			306.383
+		],
+		[
+			71.4,
+			.203,
+			305.504
+		],
+		[
+			62.7,
+			.265,
+			303.9
+		],
+		[
+			55.8,
+			.288,
+			302.321
+		],
+		[
+			49.6,
+			.265,
+			301.924
+		],
+		[
+			43.8,
+			.218,
+			303.724
+		],
+		[
+			38.1,
+			.176,
+			304.987
+		],
+		[
+			29.1,
+			.149,
+			302.717
+		]
+	],
+	fuchsia: [
+		[
+			97.7,
+			.017,
+			320.058
+		],
+		[
+			95.2,
+			.037,
+			318.852
+		],
+		[
+			90.3,
+			.076,
+			319.62
+		],
+		[
+			83.3,
+			.145,
+			321.434
+		],
+		[
+			74,
+			.238,
+			322.16
+		],
+		[
+			66.7,
+			.295,
+			322.15
+		],
+		[
+			59.1,
+			.293,
+			322.896
+		],
+		[
+			51.8,
+			.253,
+			323.949
+		],
+		[
+			45.2,
+			.211,
+			324.591
+		],
+		[
+			40.1,
+			.17,
+			325.612
+		],
+		[
+			29.3,
+			.136,
+			325.661
+		]
+	],
+	pink: [
+		[
+			97.1,
+			.014,
+			343.198
+		],
+		[
+			94.8,
+			.028,
+			342.258
+		],
+		[
+			89.9,
+			.061,
+			343.231
+		],
+		[
+			82.3,
+			.12,
+			346.018
+		],
+		[
+			71.8,
+			.202,
+			349.761
+		],
+		[
+			65.6,
+			.241,
+			354.308
+		],
+		[
+			59.2,
+			.249,
+			.584
+		],
+		[
+			52.5,
+			.223,
+			3.958
+		],
+		[
+			45.9,
+			.187,
+			3.815
+		],
+		[
+			40.8,
+			.153,
+			2.432
+		],
+		[
+			28.4,
+			.109,
+			3.907
+		]
+	],
+	rose: [
+		[
+			96.9,
+			.015,
+			12.422
+		],
+		[
+			94.1,
+			.03,
+			12.58
+		],
+		[
+			89.2,
+			.058,
+			10.001
+		],
+		[
+			81,
+			.117,
+			11.638
+		],
+		[
+			71.2,
+			.194,
+			13.428
+		],
+		[
+			64.5,
+			.246,
+			16.439
+		],
+		[
+			58.6,
+			.253,
+			17.585
+		],
+		[
+			51.4,
+			.222,
+			16.935
+		],
+		[
+			45.5,
+			.188,
+			13.697
+		],
+		[
+			41,
+			.159,
+			10.272
+		],
+		[
+			27.1,
+			.105,
+			12.094
+		]
+	],
+	slate: [
+		[
+			98.4,
+			.003,
+			247.858
+		],
+		[
+			96.8,
+			.007,
+			247.896
+		],
+		[
+			92.9,
+			.013,
+			255.508
+		],
+		[
+			86.9,
+			.022,
+			252.894
+		],
+		[
+			70.4,
+			.04,
+			256.788
+		],
+		[
+			55.4,
+			.046,
+			257.417
+		],
+		[
+			44.6,
+			.043,
+			257.281
+		],
+		[
+			37.2,
+			.044,
+			257.287
+		],
+		[
+			27.9,
+			.041,
+			260.031
+		],
+		[
+			20.8,
+			.042,
+			265.755
+		],
+		[
+			12.9,
+			.042,
+			264.695
+		]
+	],
+	gray: [
+		[
+			98.5,
+			.002,
+			247.839
+		],
+		[
+			96.7,
+			.003,
+			264.542
+		],
+		[
+			92.8,
+			.006,
+			264.531
+		],
+		[
+			87.2,
+			.01,
+			258.338
+		],
+		[
+			70.7,
+			.022,
+			261.325
+		],
+		[
+			55.1,
+			.027,
+			264.364
+		],
+		[
+			44.6,
+			.03,
+			256.802
+		],
+		[
+			37.3,
+			.034,
+			259.733
+		],
+		[
+			27.8,
+			.033,
+			256.848
+		],
+		[
+			21,
+			.034,
+			264.665
+		],
+		[
+			13,
+			.028,
+			261.692
+		]
+	],
+	zinc: [
+		[
+			98.5,
+			0,
+			0
+		],
+		[
+			96.7,
+			.001,
+			286.375
+		],
+		[
+			92,
+			.004,
+			286.32
+		],
+		[
+			87.1,
+			.006,
+			286.286
+		],
+		[
+			70.5,
+			.015,
+			286.067
+		],
+		[
+			55.2,
+			.016,
+			285.938
+		],
+		[
+			44.2,
+			.017,
+			285.786
+		],
+		[
+			37,
+			.013,
+			285.805
+		],
+		[
+			27.4,
+			.006,
+			286.033
+		],
+		[
+			21,
+			.006,
+			285.885
+		],
+		[
+			14.1,
+			.005,
+			285.823
+		]
+	],
+	neutral: [
+		[
+			98.5,
+			0,
+			0
+		],
+		[
+			97,
+			0,
+			0
+		],
+		[
+			92.2,
+			0,
+			0
+		],
+		[
+			87,
+			0,
+			0
+		],
+		[
+			70.8,
+			0,
+			0
+		],
+		[
+			55.6,
+			0,
+			0
+		],
+		[
+			43.9,
+			0,
+			0
+		],
+		[
+			37.1,
+			0,
+			0
+		],
+		[
+			26.9,
+			0,
+			0
+		],
+		[
+			20.5,
+			0,
+			0
+		],
+		[
+			14.5,
+			0,
+			0
+		]
+	],
+	stone: [
+		[
+			98.5,
+			.001,
+			106.423
+		],
+		[
+			97,
+			.001,
+			106.424
+		],
+		[
+			92.3,
+			.003,
+			48.717
+		],
+		[
+			86.9,
+			.005,
+			56.366
+		],
+		[
+			70.9,
+			.01,
+			56.259
+		],
+		[
+			55.3,
+			.013,
+			58.071
+		],
+		[
+			44.4,
+			.011,
+			73.639
+		],
+		[
+			37.4,
+			.01,
+			67.558
+		],
+		[
+			26.8,
+			.007,
+			34.298
+		],
+		[
+			21.6,
+			.006,
+			56.043
+		],
+		[
+			14.7,
+			.004,
+			49.25
+		]
+	]
+};
+/**
+* The color a Tailwind palette name stands for (`blue-500`, `white`) in Tailwind 3 or 4, as CSS;
+* undefined for any other name.
+*/
+function tailwindColor(name, major = 4) {
+	if (name === "black") return "#000";
+	if (name === "white") return "#fff";
+	const m = /^([a-z]+)-(\d+)$/.exec(name);
+	const i = m ? STEPS.indexOf(Number(m[2])) : -1;
+	if (!m || i < 0) return void 0;
+	if (major === 3) return TAILWIND_3[m[1]]?.[i];
+	const v = TAILWIND_4[m[1]]?.[i];
+	return v && `oklch(${v[0]}% ${v[1]} ${v[2]})`;
+}
+//#endregion
 //#region ../dsgraph-adapters/dist/tailwind.js
 /** Utility → the CSS property it sets and how its named values map to custom properties. */
 const UTILITIES = [
@@ -34363,17 +36115,34 @@ function classItem(cls) {
 			}
 			return;
 		}
+		const modifier = /\/[\w.[\]()-]+$/.test(rest);
 		rest = rest.replace(/\/[\w.[\]()-]+$/, "");
 		if (!rest || KEYWORDS[utility]?.has(rest)) return void 0;
 		if (/^\d+$/.test(rest) && family !== "space") return void 0;
 		const names = candidates(family, rest);
-		return names.length ? {
+		if (!names.length) return void 0;
+		const palette = (family === "color" || family === "text") && !modifier && tailwindColor(rest) ? rest : void 0;
+		return {
 			kind: "use",
 			text: cls,
 			property,
-			names
-		} : void 0;
+			names,
+			...palette ? { palette } : {}
+		};
 	}
+}
+/**
+* A color of Tailwind's own palette (`blue-500`) as a value, in Tailwind 4 unless told otherwise:
+* what a class such as `bg-blue-500` writes when the project's theme does not define the name.
+*/
+function paletteColor(name, major = 4) {
+	const css = tailwindColor(name, major);
+	const l = css ? literalsIn("color", css)[0] : void 0;
+	return l ? {
+		name,
+		text: l.text,
+		value: l.value
+	} : void 0;
 }
 /** Every class of a class string that uses a token or writes a value by hand. */
 function classesIn(text) {
@@ -34485,6 +36254,10 @@ function scanScriptText(file, text, index, opts = {}) {
 				text: item.text
 			};
 			if (item.names.length > 1) use.candidates = item.names.slice(1);
+			if (item.palette) {
+				const builtin = paletteColor(item.palette);
+				if (builtin) use.builtin = builtin;
+			}
 			index.uses.push(use);
 		} else {
 			const lit = {
@@ -34745,6 +36518,7 @@ async function scanCode(source, opts = {}) {
 		literals: [],
 		skipped: []
 	};
+	const styles = [];
 	if (files.length < all.length) index.limited = all.length;
 	for (const file of files) {
 		let text;
@@ -34776,8 +36550,31 @@ async function scanCode(source, opts = {}) {
 		index.files.push(file);
 		index.uses.push(...part.uses);
 		index.literals.push(...part.literals);
+		if (/\.s?css$/i.test(file)) styles.push(text);
+	}
+	const major = index.uses.some((u) => u.builtin) ? await tailwindMajor(source, styles) : 4;
+	if (major < 4) for (const u of index.uses) {
+		if (!u.builtin) continue;
+		const v3 = major === 3 ? paletteColor(u.builtin.name, 3) : void 0;
+		if (v3) u.builtin = v3;
+		else delete u.builtin;
 	}
 	return index;
+}
+/**
+* The Tailwind version a project uses: from `tailwindcss` in its package.json, else from its
+* styles (`@tailwind base` is Tailwind 3 or older, `@import "tailwindcss"` Tailwind 4); 4 when
+* nothing says.
+*/
+async function tailwindMajor(source, styles) {
+	try {
+		const pkg = JSON.parse(await source.readText("package.json"));
+		const range = pkg.dependencies?.tailwindcss ?? pkg.devDependencies?.tailwindcss ?? pkg.peerDependencies?.tailwindcss;
+		const major = range && /(\d+)/.exec(range)?.[1];
+		if (major) return Number(major);
+	} catch {}
+	if (styles.some((s) => /@import\s+["']tailwindcss/.test(s))) return 4;
+	return styles.some((s) => /@tailwind\s+(base|components|utilities)/.test(s)) ? 3 : 4;
 }
 //#endregion
 //#region ../dsgraph-adapters/dist/css-tokens.js
@@ -35088,7 +36885,7 @@ const FONT_WEIGHTS = {
 	ultrablack: 950
 };
 const WHOLE_REF = /^\{[^{}]+\}$/;
-const NUM = /^\s*(-?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)\s*$/i;
+const NUM$1 = /^\s*(-?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)\s*$/i;
 const isObj$2 = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 /**
 * References as these tools write them, in DTCG syntax: `{a.b.value}` and `{a.b.$value}` drop the
@@ -35121,7 +36918,7 @@ function dimension(v, c, percentAs) {
 	if (typeof v !== "string") return v;
 	const d = deferred(v, c);
 	if (d !== void 0) return d;
-	const m = NUM.exec(v);
+	const m = NUM$1.exec(v);
 	if (m) {
 		const n = Number(m[1]);
 		const unit = m[2].toLowerCase();
@@ -35141,7 +36938,7 @@ function numberValue(v, c) {
 	if (typeof v !== "string") return v;
 	const d = deferred(v, c);
 	if (d !== void 0) return d;
-	const m = NUM.exec(v);
+	const m = NUM$1.exec(v);
 	if (m && (m[2] === "" || m[2] === "%")) return m[2] === "%" ? Number(m[1]) / 100 : Number(m[1]);
 	return evaluateExpression(v, "number") ?? v;
 }
@@ -35189,7 +36986,7 @@ function lineHeight(v, c) {
 		value: d
 	};
 	if (/^auto$/i.test(v.trim())) return void 0;
-	const m = NUM.exec(v);
+	const m = NUM$1.exec(v);
 	if (!m) return {
 		type: "number",
 		value: evaluateExpression(v, "number") ?? v
@@ -35253,7 +37050,7 @@ function duration(v) {
 		unit: "ms"
 	};
 	if (typeof v !== "string") return v;
-	const m = NUM.exec(v);
+	const m = NUM$1.exec(v);
 	if (m && (m[2] === "" || m[2] === "ms" || m[2] === "s")) return {
 		value: Number(m[1]),
 		unit: m[2] || "ms"
@@ -36410,17 +38207,35 @@ function excepted(options) {
 }
 /** Namespaces of Tailwind 4 theme variables: `--color-accent` is `bg-accent`, `--radius-md` is `rounded-md`. */
 const NAMESPACE = /^(color|radius|spacing|text|font-weight|font|shadow|leading|tracking)-/;
+/** The token types each Tailwind 4 theme namespace holds. */
+const NAMESPACE_TYPES = {
+	color: ["color"],
+	radius: ["dimension"],
+	spacing: ["dimension"],
+	text: ["dimension"],
+	"font-weight": ["fontWeight", "number"],
+	font: ["fontFamily", "fontWeight"],
+	shadow: ["shadow"],
+	leading: ["dimension", "number"],
+	tracking: ["dimension"]
+};
 /**
 * The class that replaces an arbitrary value with a token, variants kept: `hover:bg-[#2952cc]` and
 * `color-accent` give `hover:bg-accent`; a bare color name (`primary`) gives `bg-primary`; any other
 * token is named as a variable, `p-(--space-md)`.
 */
 function classFor(source, token) {
-	const m = /^((?:[\w-]+:)*)(!?-?)([a-z]+(?:-[a-z]+)*?)-\[/.exec(source);
+	const named = /^(.*?-)([a-z]+-\d+|black|white)$/.exec(source);
+	const arbitrary = source.includes("[") || !named ? source : `${named[1]}[x]`;
+	const m = /^((?:[\w-]+:)*)(!?-?)([a-z]+(?:-[a-z]+)*?)-\[/.exec(arbitrary);
 	if (!m) return token.id;
 	const [, variants, sign, utility] = m;
 	const id = token.id;
-	return `${variants}${sign}${utility}-${id.includes(".") ? `(--${id.replace(/\./g, "-")})` : NAMESPACE.test(id) ? id.replace(NAMESPACE, "") : token.type === "color" ? id : `(--${id})`}`;
+	const space = NAMESPACE.exec(id)?.[1];
+	const fits = space !== void 0 && NAMESPACE_TYPES[space]?.includes(token.type ?? "");
+	let name = id.includes(".") ? `(--${id.replace(/\./g, "-")})` : fits ? id.replace(NAMESPACE, "") : token.type === "color" && space === void 0 ? id : `(--${id})`;
+	if (name.startsWith(`${utility}-`)) name = `(--${id})`;
+	return `${variants}${sign}${utility}-${name}`;
 }
 const pxOf = (v) => {
 	const d = v;
@@ -36477,11 +38292,12 @@ const hardcodedColor = {
 	id: "style/hardcoded-color",
 	description: "A color in a style is written by hand instead of taken from a token.",
 	defaultSeverity: "warning",
-	run({ graph, code, options, knowledge, report }) {
+	run({ graph, code, vars, options, knowledge, report }) {
 		if (!code || graph.tokens({ type: "color" }).length === 0) return;
 		const skip = excepted(options);
 		const memo = /* @__PURE__ */ new Map();
-		for (const l of code.literals) {
+		const palette = paletteLiterals(code, vars);
+		for (const l of [...code.literals, ...palette]) {
 			if (l.type !== "color" || skip(l)) continue;
 			const { states, components } = styleContext(l, knowledge);
 			const key = [
@@ -36494,7 +38310,7 @@ const hardcodedColor = {
 			const near = memo.get(key);
 			if (!near) continue;
 			report({
-				message: l.source ? near.exact ? `"${l.source}" writes a color by hand; use "${classFor(l.source, near.token)}" (token "${near.token.id}")` : `"${l.source}" is not in the palette; closest is "${classFor(l.source, near.token)}" (token "${near.token.id}", ΔE ${near.distance})` : near.exact ? `Color "${l.text}" in ${l.property} is written by hand; use "${near.token.id}"` : `Color "${l.text}" in ${l.property} is not in the palette; closest is "${near.token.id}" (ΔE ${near.distance})`,
+				message: palette.includes(l) ? `"${l.source}" is Tailwind's own color, not one of the system's; use "${classFor(l.source, near.token)}" (token "${near.token.id}"${near.exact ? "" : `, ΔE ${near.distance}`})` : l.source ? near.exact ? `"${l.source}" writes a color by hand; use "${classFor(l.source, near.token)}" (token "${near.token.id}")` : `"${l.source}" is not in the palette; closest is "${classFor(l.source, near.token)}" (token "${near.token.id}", ΔE ${near.distance})` : near.exact ? `Color "${l.text}" in ${l.property} is written by hand; use "${near.token.id}"` : `Color "${l.text}" in ${l.property} is not in the palette; closest is "${near.token.id}" (ΔE ${near.distance})`,
 				nodes: [near.token.id],
 				evidence: {
 					value: l.text,
@@ -36504,13 +38320,37 @@ const hardcodedColor = {
 					token: near.token.id,
 					replacement: l.source ? classFor(l.source, near.token) : near.token.id,
 					exact: near.exact,
-					deltaE: near.distance
+					deltaE: near.distance,
+					...palette.includes(l) ? { builtin: true } : {}
 				},
 				loc: locOf(l)
 			});
 		}
 	}
 };
+/**
+* Classes of Tailwind's own palette (`bg-blue-500`) the system has no token for, as colors written
+* by hand: the color is Tailwind's, not the design system's.
+*/
+function paletteLiterals(code, vars) {
+	const out = [];
+	for (const u of code.uses) {
+		if (!u.builtin || !u.text || vars?.tokenOfUse(u)) continue;
+		const l = {
+			file: u.file,
+			line: u.line,
+			column: u.column,
+			property: u.property,
+			text: u.builtin.text,
+			source: u.text,
+			type: "color",
+			value: u.builtin.value
+		};
+		if (u.selector) l.selector = u.selector;
+		out.push(l);
+	}
+	return out;
+}
 const offScale = {
 	id: "style/off-scale",
 	description: "A spacing, radius or font size in a style is written by hand: on the scale (use the token) or off it.",
@@ -36580,7 +38420,7 @@ const unknownToken = {
 		const skip = excepted(options);
 		for (const u of code.uses) {
 			const names = [u.name, ...u.candidates ?? []];
-			if (skip(u) || !names.some((n) => vars.isSystemName(n)) || vars.tokenOfUse(u)) continue;
+			if (skip(u) || u.builtin || !names.some((n) => vars.isSystemName(n)) || vars.tokenOfUse(u)) continue;
 			report({
 				message: `"${u.text ?? u.name}" is not a token${u.fallback ? `; the fallback "${u.fallback}" is used instead` : ""}`,
 				nodes: [],
@@ -36620,6 +38460,176 @@ const unusedToken = {
 				nodes: [t.id],
 				token: t
 			});
+		}
+	}
+};
+//#endregion
+//#region ../dsgraph-rules/dist/rules/consistency.js
+const whenText = (when) => Object.entries(when).map(([k, v]) => `${k}: ${v}`).join(", ");
+const px = (v) => {
+	const d = v;
+	if (!d || typeof d.value !== "number") return void 0;
+	return d.unit === "rem" ? d.value * 16 : d.unit === "px" ? d.value : void 0;
+};
+/** A value nobody would set on purpose next to real ones: an empty string, a 0 weight, a 0 size. */
+function emptiness(type, v) {
+	const raw = v.raw;
+	if (raw === "" || Array.isArray(v.value) && v.value.every((x) => x === "")) return "empty";
+	if (type === "fontWeight" && raw === 0) return "0";
+	if (type === "dimension" && px(v.value) === 0) return "0px";
+}
+/** A value as people read it: a size in px, a color as hex, otherwise as written. */
+const shown = (v) => {
+	const size = px(v.value);
+	if (size !== void 0) return `${size}px`;
+	const c = v.value;
+	if (c && typeof c === "object" && "space" in c) return colorToHex(c);
+	if (Array.isArray(v.value) && v.value.every((x) => typeof x === "string")) return v.value.join(", ") || "\"\"";
+	return typeof v.raw === "string" ? v.raw || "\"\"" : JSON.stringify(v.raw);
+};
+const emptyInContext = {
+	id: "context/empty-value",
+	description: "A token has a value in some themes or modes and an empty one (0, \"\") in another.",
+	defaultSeverity: "warning",
+	run({ graph, report }) {
+		for (const t of graph.tokens()) {
+			const set = t.values.filter((v) => Object.keys(v.when ?? {}).length);
+			if (set.length < 2) continue;
+			const empty = set.filter((v) => emptiness(t.type, v));
+			const full = set.filter((v) => !emptiness(t.type, v));
+			if (!empty.length || !full.length) continue;
+			for (const v of empty) report({
+				message: `"${t.id}" is ${emptiness(t.type, v)} in ${whenText(v.when)}, while ${whenText(full[0].when)} has ${shown(full[0])}: the value was probably never set`,
+				nodes: [t.id],
+				when: v.when,
+				evidence: {
+					empty: v.raw,
+					other: full[0].raw,
+					otherWhen: full[0].when
+				},
+				token: t
+			});
+		}
+	}
+};
+const literalInContext = {
+	id: "context/literal-value",
+	description: "A token references other tokens in every theme or mode but one, where its value is written by hand.",
+	defaultSeverity: "info",
+	run({ graph, report }) {
+		for (const t of graph.tokens()) {
+			const set = t.values.filter((v) => Object.keys(v.when ?? {}).length);
+			if (set.length < 2) continue;
+			const alias = (v) => v.refs.some((r) => !r.property);
+			const literal = set.filter((v) => !alias(v));
+			if (literal.length !== 1 || set.length - literal.length < 1) continue;
+			const v = literal[0];
+			if (emptiness(t.type, v)) continue;
+			report({
+				message: `"${t.id}" is written by hand in ${whenText(v.when)} (${shown(v)}), while every other value references a token`,
+				nodes: [t.id],
+				when: v.when,
+				evidence: { value: v.raw },
+				token: t
+			});
+		}
+	}
+};
+/** A field of a typography token in px, through its reference or as written. */
+function fieldPx(graph, t, field) {
+	const v = t.values[0];
+	if (!v) return void 0;
+	const ref = v.refs.find((r) => r.property === `/${field}`);
+	if (ref) return px(graph.value(ref.to, v.when));
+	return px(v.raw?.[field]);
+}
+const NUM = String.raw`(-?\d+(?:[.,]\d+)?)`;
+const num = (s) => Number(s.replace(",", "."));
+/**
+* Numbers a description states about a token's value: `13 · …` for a size, `16/25` (size and line
+* height) and `−1.2%` (tracking) for typography. Each is compared with the value it describes.
+*/
+const descriptionMismatch = {
+	id: "description/value-mismatch",
+	description: "A number in a token’s description no longer matches its value.",
+	defaultSeverity: "warning",
+	run({ graph, report }) {
+		const say = (t, what, said, is) => report({
+			message: `"${t.id}": the description says ${what ? `${what} ` : ""}${said}, the value is ${is}`,
+			nodes: [t.id],
+			evidence: {
+				description: t.description,
+				said,
+				value: is
+			},
+			token: t
+		});
+		for (const t of graph.tokens()) {
+			const d = t.description?.trim();
+			if (!d) continue;
+			if (t.type === "dimension") {
+				const m = new RegExp(String.raw`^${NUM}\s*(?:px)?\s*(?:·|—|–|:|$)`).exec(d);
+				if (!m) continue;
+				const said = num(m[1]);
+				const values = t.values.map((v) => px(v.value)).filter((x) => x !== void 0);
+				if (values.length && !values.some((x) => Math.abs(x - said) < .01)) say(t, "", said, values[0]);
+			} else if (t.type === "typography") {
+				const size = fieldPx(graph, t, "fontSize");
+				const pair = new RegExp(String.raw`(?:^|\s)${NUM}\s*/\s*${NUM}(?=\s|$|·)`).exec(d);
+				if (pair && size !== void 0) {
+					const line = fieldPx(graph, t, "lineHeight");
+					if (Math.abs(num(pair[1]) - size) > .01) say(t, "size", num(pair[1]), size);
+					else if (line !== void 0 && Math.abs(num(pair[2]) - line) > .01) say(t, "line height", num(pair[2]), line);
+				}
+				const pct = new RegExp(String.raw`${NUM.replace("-?", "[-−]?")}\s*%`).exec(d);
+				const tracking = fieldPx(graph, t, "letterSpacing");
+				if (pct && size && tracking !== void 0) {
+					const said = num(pct[1].replace("−", "-"));
+					const is = Math.round(tracking / size * 1e3) / 10;
+					if (Math.abs(said - is) > .15) say(t, "tracking %", said, is);
+				}
+			}
+		}
+	}
+};
+const FIELDS = [
+	"fontFamily",
+	"fontSize",
+	"fontWeight",
+	"lineHeight",
+	"letterSpacing"
+];
+/**
+* A field most typography tokens take from a token, written by hand in one of them: the style
+* stops following the system when that token changes.
+*/
+const unlinkedTypographyField = {
+	id: "typography/unlinked-field",
+	description: "A typography field is written by hand where most typography tokens reference a token.",
+	defaultSeverity: "warning",
+	run({ graph, report }) {
+		const all = graph.tokens({ type: "typography" });
+		if (all.length < 4) return;
+		const linked = (t, f) => t.values.some((v) => v.refs.some((r) => r.property === `/${f}`));
+		for (const f of FIELDS) {
+			const by = all.filter((t) => linked(t, f));
+			if (by.length / all.length < .75) continue;
+			for (const t of all) {
+				if (linked(t, f)) continue;
+				const raw = t.values[0]?.raw?.[f];
+				if (raw === void 0) continue;
+				report({
+					message: `"${t.id}" writes ${f} by hand (${JSON.stringify(raw)}); ${by.length} of ${all.length} typography tokens take it from a token`,
+					nodes: [t.id],
+					evidence: {
+						field: f,
+						value: raw,
+						linked: by.length,
+						total: all.length
+					},
+					token: t
+				});
+			}
 		}
 	}
 };
@@ -36689,6 +38699,28 @@ const allowedSources = {
 				token: source
 			});
 		}
+	}
+};
+/**
+* References that go against the layers dsgraph reads from the system itself (`inferLayers`): a
+* component that takes its value straight from the palette, past the semantic layer, or a lower
+* layer that references a higher one. For systems that do not set `layers` in the config.
+*/
+const layerCrossing = {
+	id: "layer/crossing",
+	description: "A reference goes against the layers read from the system: past the semantic layer, or upwards.",
+	defaultSeverity: "off",
+	run({ graph, knowledge, report }) {
+		for (const c of inferLayers(graph, knowledge).crossings) report({
+			message: c.kind === "skips-semantic" ? `"${c.from}" (${c.fromLayer}) takes its value straight from "${c.to}" (${c.toLayer}), past the semantic layer` : `"${c.from}" (${c.fromLayer}) references "${c.to}", a ${c.toLayer} token`,
+			nodes: [c.from, c.to],
+			evidence: {
+				kind: c.kind,
+				fromLayer: c.fromLayer,
+				toLayer: c.toLayer
+			},
+			token: graph.token(c.from)
+		});
 	}
 };
 //#endregion
@@ -36928,8 +38960,13 @@ const RULES = [
 			}
 		}
 	},
+	emptyInContext,
+	literalInContext,
+	descriptionMismatch,
+	unlinkedTypographyField,
 	aliasDepth,
 	allowedSources,
+	layerCrossing,
 	hardcodedColor,
 	offScale,
 	deprecatedUsage,
