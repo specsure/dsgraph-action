@@ -8026,7 +8026,7 @@ const varNames = (code) => code.uses.filter((u) => !u.text).map((u) => u.name);
 /** How much of the code's design values come from tokens. */
 function coverageOf(code, vars) {
 	const fromTokens = code.uses.filter((u) => vars.tokenOfUse(u)).length;
-	const byHand = code.literals.length;
+	const byHand = code.literals.length + code.uses.filter((u) => u.builtin && !vars.tokenOfUse(u)).length;
 	const total = fromTokens + byHand;
 	return {
 		fromTokens,
@@ -11933,7 +11933,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.8.0";
+const GENERATOR = "dsgraph@0.8.1";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
