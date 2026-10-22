@@ -8026,7 +8026,8 @@ const varNames = (code) => code.uses.filter((u) => !u.text).map((u) => u.name);
 /** How much of the code's design values come from tokens. */
 function coverageOf(code, vars) {
 	const fromTokens = code.uses.filter((u) => vars.tokenOfUse(u)).length;
-	const byHand = code.literals.length + code.uses.filter((u) => u.builtin && !vars.tokenOfUse(u)).length;
+	const own = (u) => !!u.resolved && !vars.tokenOfUse(u) && !u.resolved.via.some((name) => vars.token(name));
+	const byHand = code.literals.length + code.uses.filter((u) => u.builtin && !vars.tokenOfUse(u) || own(u)).length;
 	const total = fromTokens + byHand;
 	return {
 		fromTokens,
@@ -8042,7 +8043,11 @@ function formatCoverage(c) {
 const REM = 16;
 /** How far apart two values of a type are, in the unit people think in; undefined when not comparable. */
 function valueDistance(type, a, b, remBase = REM) {
-	if (type === "color") return deltaEOK(a, b);
+	if (type === "color") {
+		const ca = a;
+		const cb = b;
+		return deltaEOK(ca, cb) + Math.abs((ca.alpha ?? 1) - (cb.alpha ?? 1)) * 100;
+	}
 	if (type === "dimension") {
 		const pa = toPx(a, remBase);
 		const pb = toPx(b, remBase);
@@ -8591,6 +8596,69 @@ function selectDocuments(system, input) {
 	return docs;
 }
 //#endregion
+//#region ../dsgraph-core/dist/values/css-shadow.js
+/** Splits at a separator outside parentheses: `0 1px rgba(0, 0, 0, .1), 0 2px #000` by commas. */
+function split(value, sep) {
+	const out = [];
+	let depth = 0;
+	let part = "";
+	for (const ch of value) {
+		if (ch === "(") depth++;
+		else if (ch === ")") depth--;
+		if (depth === 0 && sep.test(ch)) {
+			if (part.trim()) out.push(part.trim());
+			part = "";
+		} else part += ch;
+	}
+	if (part.trim()) out.push(part.trim());
+	return out;
+}
+const LENGTH$2 = /^(-?\d*\.?\d+)(px|rem|em)?$/i;
+/**
+* A CSS `box-shadow` written as a string (`0 1px 2px rgba(16,16,14,.06), 0 1px 1px #0000000a`) as
+* DTCG shadow layers; `none` is no layer. Undefined when it is not a shadow CSS would draw.
+*/
+function cssShadow(value) {
+	if (value.trim().toLowerCase() === "none") return [];
+	const layers = [];
+	for (const layer of split(value, /,/)) {
+		let inset = false;
+		let color;
+		const lengths = [];
+		for (const p of split(layer, /\s/)) {
+			if (p.toLowerCase() === "inset") {
+				inset = true;
+				continue;
+			}
+			const m = LENGTH$2.exec(p);
+			if (m && lengths.length < 4) {
+				lengths.push({
+					value: Number(m[1]),
+					unit: (m[2] ?? "px").toLowerCase()
+				});
+				continue;
+			}
+			const c = cssColorToDtcg(p);
+			if (!c || color) return void 0;
+			color = c;
+		}
+		if (lengths.length < 2 || !color) return void 0;
+		const zero = {
+			value: 0,
+			unit: "px"
+		};
+		layers.push({
+			color,
+			offsetX: lengths[0],
+			offsetY: lengths[1],
+			blur: lengths[2] ?? zero,
+			spread: lengths[3] ?? zero,
+			...inset ? { inset } : {}
+		});
+	}
+	return layers.length ? layers : void 0;
+}
+//#endregion
 //#region ../dsgraph-core/dist/values/canonical.js
 const STANDARD_TYPES = /* @__PURE__ */ new Set([
 	"color",
@@ -8671,7 +8739,7 @@ function canonicalValue(type, raw, ctx) {
 		});
 		case "shadow": return shadow(raw, ctx);
 		case "gradient": return gradient(raw, ctx);
-		case "typography": return typography$1(raw, ctx);
+		case "typography": return typography$2(raw, ctx);
 		case "css-expression": return typeof raw === "string" ? raw.trim().replace(/\s+/g, " ") : raw;
 		default: return raw;
 	}
@@ -8768,6 +8836,12 @@ function composite(raw, ctx, name, fields) {
 	return out;
 }
 function shadow(raw, ctx) {
+	if (typeof raw === "string") {
+		const layers = cssShadow(raw);
+		if (!layers) return invalid(ctx, "dtcg/invalid-shadow", `Shadow "${raw}" is not a CSS shadow`);
+		if (!lenient(ctx, "dtcg/legacy-syntax", `Shadow "${raw}" is a string; DTCG 2025.10 requires objects`)) return void 0;
+		raw = layers;
+	}
 	const layers = Array.isArray(raw) ? raw.flat() : [raw];
 	const out = [];
 	for (const layer of layers) {
@@ -8820,7 +8894,7 @@ function gradient(raw, ctx) {
 	}
 	return out;
 }
-function typography$1(raw, ctx) {
+function typography$2(raw, ctx) {
 	if (!isPlainObject(raw)) return invalid(ctx, "dtcg/invalid-typography", "typography value must be an object");
 	const out = {};
 	for (const [field, type] of Object.entries({
@@ -8876,7 +8950,7 @@ const DEFAULT_COMPARE = {
 const EQUAL = { result: "equal" };
 const NOTATION = { result: "notation" };
 const sameJson = (a, b) => canonicalize(a) === canonicalize(b);
-const round$1 = (n, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
+const round$2 = (n, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 const COMPOSITE_FIELDS = {
 	border: {
 		color: "color",
@@ -8919,7 +8993,7 @@ function compareValues(type, a, b, opts = DEFAULT_COMPARE) {
 			const diff = durationMs(b) - durationMs(da);
 			if (Math.abs(diff) > 1e-6) return {
 				result: "changed",
-				delta: { ms: round$1(diff) }
+				delta: { ms: round$2(diff) }
 			};
 			return sameJson(a, b) ? EQUAL : NOTATION;
 		}
@@ -8928,7 +9002,7 @@ function compareValues(type, a, b, opts = DEFAULT_COMPARE) {
 			const diff = b - a;
 			return Math.abs(diff) < 1e-6 ? EQUAL : {
 				result: "changed",
-				delta: { by: round$1(diff) }
+				delta: { by: round$2(diff) }
 			};
 		}
 		case "fontFamily": {
@@ -8948,8 +9022,8 @@ function compareColor(a, b, opts) {
 	const dE = deltaEOK(a, b);
 	const dAlpha = b.alpha - a.alpha;
 	if (dE < opts.equalDeltaE && Math.abs(dAlpha) < .001) return a.space === b.space && sameJson(a.components, b.components) && a.alpha === b.alpha ? EQUAL : NOTATION;
-	const delta = { deltaEOK: round$1(dE, 2) };
-	if (Math.abs(dAlpha) >= .001) delta.deltaAlpha = round$1(dAlpha, 3);
+	const delta = { deltaEOK: round$2(dE, 2) };
+	if (Math.abs(dAlpha) >= .001) delta.deltaAlpha = round$2(dAlpha, 3);
 	return {
 		result: "changed",
 		delta
@@ -8966,13 +9040,13 @@ function compareDimension(a, b, opts) {
 		const diff = b.value - a.value;
 		return Math.abs(diff) < 1e-6 ? EQUAL : {
 			result: "changed",
-			delta: { [a.unit]: round$1(diff) }
+			delta: { [a.unit]: round$2(diff) }
 		};
 	}
 	const diff = pb - pa;
 	if (Math.abs(diff) < 1e-6) return a.unit === b.unit && a.value === b.value ? EQUAL : NOTATION;
-	const delta = { px: round$1(diff) };
-	if (pa !== 0) delta.ratio = round$1(diff / pa);
+	const delta = { px: round$2(diff) };
+	if (pa !== 0) delta.ratio = round$2(diff / pa);
 	return {
 		result: "changed",
 		delta
@@ -9837,7 +9911,7 @@ const UNITS = /* @__PURE__ */ new Set([
 	"ch",
 	"ex"
 ]);
-const round = (n) => Math.round(n * 1e6) / 1e6;
+const round$1 = (n) => Math.round(n * 1e6) / 1e6;
 /** Evaluates `+ - * /` and parentheses over numbers with units; undefined if not arithmetic. */
 function evaluateMath(text) {
 	const src = text.replace(/calc\(/gi, "(");
@@ -9934,7 +10008,7 @@ function evaluateMath(text) {
 	const result = expr();
 	if (!result || pos !== tokens.length || !Number.isFinite(result.value)) return void 0;
 	return {
-		value: round(result.value),
+		value: round$1(result.value),
 		unit: result.unit
 	};
 }
@@ -9975,7 +10049,7 @@ function evaluateExpression(text, hint, defaultUnit) {
 	}
 	const q = evaluateMath(text);
 	if (!q) return void 0;
-	if (hint === "number" && q.unit === "%") return round(q.value / 100);
+	if (hint === "number" && q.unit === "%") return round$1(q.value / 100);
 	if (q.unit === "") {
 		if (hint === "dimension" && defaultUnit) return {
 			value: q.value,
@@ -11720,17 +11794,30 @@ const NOT_TOKENS = /(^|\/)(package(-lock)?|tsconfig[\w.-]*|jsconfig|composer|ler
 //#endregion
 //#region ../dsgraph-core/dist/resolver/modes.js
 const THEME_WORDS = /* @__PURE__ */ new Set(["light", "dark"]);
-/** The token without `mode` in its extensions (and without empty extensions left behind). */
+/**
+* The Figma collection a token says it was exported from: `com.figma.collection`, or a
+* `figma.collection.name` some exporters write. Empty when it says none.
+*/
+function collectionOf(token) {
+	const ext = token.$extensions;
+	const own = ext?.["com.figma.collection"];
+	if (typeof own === "string") return own;
+	const figma = ext?.figma;
+	return typeof figma?.collection?.name === "string" ? figma.collection.name : "";
+}
+/** The context a token's own `$value` stands for when `modes` lists only the overrides. */
+const BASE_MODE = "default";
+/** The token without `mode` or `modes` in its extensions (and without empty extensions left behind). */
 function withoutModes(token) {
 	const { $extensions, ...rest } = token;
 	if (!isPlainObject($extensions)) return token;
-	const { mode: _mode, ...ext } = $extensions;
+	const { mode: _mode, modes: _modes, ...ext } = $extensions;
 	return Object.keys(ext).length > 0 ? {
 		...rest,
 		$extensions: ext
 	} : rest;
 }
-function setAt(tree, path, value) {
+function setAt$1(tree, path, value) {
 	let node = tree;
 	for (const seg of path.slice(0, -1)) {
 		if (!isPlainObject(node[seg])) node[seg] = {};
@@ -11743,11 +11830,16 @@ function strip(tree, found, path = []) {
 	if (!isPlainObject(tree)) return tree;
 	if (Object.hasOwn(tree, "$value")) {
 		const ext = tree.$extensions;
-		if (!isPlainObject(ext) || !isPlainObject(ext.mode)) return tree;
-		if (Object.keys(ext.mode).length > 1) found.push({
+		if (!isPlainObject(ext)) return tree;
+		const modes = isPlainObject(ext.mode) ? ext.mode : isPlainObject(ext.modes) && Object.keys(ext.modes).length > 0 ? {
+			[BASE_MODE]: tree.$value,
+			...ext.modes
+		} : void 0;
+		if (!modes) return tree;
+		if (Object.keys(modes).length > 1) found.push({
 			path,
 			token: withoutModes(tree),
-			modes: ext.mode
+			modes
 		});
 		return withoutModes(tree);
 	}
@@ -11757,7 +11849,9 @@ function strip(tree, found, path = []) {
 }
 /**
 * Modes written per token in `$extensions.mode` (`{ "light": …, "dark": … }`), as Figma variable
-* exports and some build tools write them, become modifiers. Tokens that share the same mode names share a
+* exports and some build tools write them, become modifiers; so do `$extensions.modes` that list
+* only the modes where a value differs (`{ "mobile": … }`), the token's own value then being the
+* `default` context. Tokens that share the same mode names share a
 * modifier; it is called `theme` for light and dark, otherwise after the top-level group (a Figma
 * collection) its tokens live in. Systems that already have modifiers are left as they are.
 */
@@ -11790,7 +11884,8 @@ function expandModes(system, diag) {
 		if (!g) {
 			g = {
 				modes,
-				roots: /* @__PURE__ */ new Set()
+				roots: /* @__PURE__ */ new Set(),
+				collections: /* @__PURE__ */ new Set()
 			};
 			groups.push(g);
 		}
@@ -11801,6 +11896,7 @@ function expandModes(system, diag) {
 	for (const { tokens } of byDoc) for (const t of tokens) {
 		const g = groupOf(Object.keys(t.modes));
 		g.roots.add(t.path.length > 1 ? t.path[0] : "");
+		g.collections.add(collectionOf(t.token));
 		tokenGroup.set(t, g);
 	}
 	const out = {
@@ -11811,7 +11907,8 @@ function expandModes(system, diag) {
 	};
 	const names = [];
 	for (const g of groups) {
-		let name = g.modes.some((m) => THEME_WORDS.has(m.toLowerCase())) ? "theme" : g.roots.size === 1 && [...g.roots][0] ? [...g.roots][0] : "mode";
+		const collection = g.collections.size === 1 ? [...g.collections][0] : "";
+		let name = collection ? collection : g.modes.some((m) => THEME_WORDS.has(m.toLowerCase())) ? "theme" : g.roots.size === 1 && [...g.roots][0] ? [...g.roots][0] : "mode";
 		for (let i = 2; names.includes(name); i++) name = `${name.replace(/-\d+$/, "")}-${i}`;
 		names.push(name);
 		const contexts = /* @__PURE__ */ new Map();
@@ -11819,7 +11916,7 @@ function expandModes(system, diag) {
 			const docs = [];
 			for (const { file, tokens } of byDoc) {
 				const tree = {};
-				for (const t of tokens) if (tokenGroup.get(t) === g && Object.hasOwn(t.modes, mode)) setAt(tree, t.path, {
+				for (const t of tokens) if (tokenGroup.get(t) === g && Object.hasOwn(t.modes, mode)) setAt$1(tree, t.path, {
 					...t.token,
 					$value: t.modes[mode]
 				});
@@ -11933,7 +12030,7 @@ function createResolver(system, opts) {
 }
 //#endregion
 //#region ../dsgraph-core/dist/snapshot.js
-const GENERATOR = "dsgraph@0.8.1";
+const GENERATOR = "dsgraph@0.9.0";
 const inputKey = (input) => canonicalize(input);
 /** Builds a canonical snapshot by resolving every permutation of contexts (Resolver 2025.10). */
 async function buildSnapshot(system, opts = {}) {
@@ -33995,7 +34092,18 @@ function scanCssText(file, text, index, opts = {}) {
 			if (v.fallback !== void 0) use.fallback = v.fallback;
 			index.uses.push(use);
 		}
-		if (property.startsWith("--") || property.startsWith("$") || property.startsWith("@")) return;
+		if (property.startsWith("--")) {
+			const def = {
+				...loc,
+				name: property,
+				value: decl.value.trim()
+			};
+			if (selector) def.selector = selector;
+			if (!index.definitions) index.definitions = [];
+			index.definitions.push(def);
+			return;
+		}
+		if (property.startsWith("$") || property.startsWith("@")) return;
 		if (/#\{|\$[\w-]|__expr__/.test(decl.value)) return;
 		for (const l of literalsIn(property, decl.value)) {
 			const lit = {
@@ -34007,6 +34115,63 @@ function scanCssText(file, text, index, opts = {}) {
 			index.literals.push(lit);
 		}
 	});
+}
+/** Selectors that define a variable for the whole page, not for one theme or one component. */
+const GLOBAL = /^(:root|html|:host|body|\*)?$/;
+/** Stylesheets apply wherever they are linked; a definition in a page or a component stays there. */
+const SHEET = /\.(s?css|sass|less)$/i;
+/**
+* What the code's own definitions make of each `var()` it uses: the chain of variables followed to
+* a value written in one of them (`--sp-accent` → `--sp-blue-600` → `#2563eb`), read as the property
+* that uses it. A definition in the same file comes first, then one in a stylesheet; a page-wide one
+* is taken over one for a theme or a component. Uses of names the code does not define, and values
+* that are not one literal, stay unresolved.
+*/
+function resolveVars(index) {
+	const byName = /* @__PURE__ */ new Map();
+	for (const d of index.definitions ?? []) byName.set(d.name, [...byName.get(d.name) ?? [], d]);
+	if (!byName.size) return;
+	const best = (ds) => ds.find((d) => GLOBAL.test(d.selector ?? "")) ?? ds[0];
+	const pick = (name, file) => {
+		const ds = byName.get(name);
+		if (!ds) return void 0;
+		const here = ds.filter((d) => d.file === file);
+		if (here.length) return best(here);
+		const sheets = ds.filter((d) => SHEET.test(d.file));
+		return sheets.length ? best(sheets) : void 0;
+	};
+	for (const u of index.uses) {
+		if (u.property.startsWith("--") || u.resolved) continue;
+		const via = [];
+		let name = u.name;
+		let file = u.file;
+		let def;
+		while (name && via.length < 10 && !via.includes(name)) {
+			const found = pick(name, file);
+			if (!found) break;
+			def = found;
+			via.push(name);
+			file = def.file;
+			const next = /^var\(\s*(--[\w-]+)\s*(?:,[^)]*)?\)$/.exec(def.value);
+			if (!next) break;
+			name = next[1];
+		}
+		if (!def || !via.length || /^var\(/.test(def.value)) continue;
+		if (plainParts(def.value).length !== 1) continue;
+		const l = literalsIn(u.property, def.value)[0];
+		if (!l) continue;
+		u.resolved = {
+			text: l.text,
+			type: l.type,
+			value: l.value,
+			via,
+			at: {
+				file: def.file,
+				line: def.line,
+				column: def.column
+			}
+		};
+	}
 }
 const SASS_DECL = /^\s*(--[\w-]+|\$?[a-z][\w-]*)\s*:\s+(.*?)\s*;?\s*$/i;
 const SASS_OLD_DECL = /^\s*:([a-z][\w-]*)\s+(.*?)\s*$/i;
@@ -36550,8 +36715,10 @@ async function scanCode(source, opts = {}) {
 		index.files.push(file);
 		index.uses.push(...part.uses);
 		index.literals.push(...part.literals);
+		if (part.definitions) index.definitions = [...index.definitions ?? [], ...part.definitions];
 		if (/\.s?css$/i.test(file)) styles.push(text);
 	}
+	resolveVars(index);
 	const major = index.uses.some((u) => u.builtin) ? await tailwindMajor(source, styles) : 4;
 	if (major < 4) for (const u of index.uses) {
 		if (!u.builtin) continue;
@@ -36806,6 +36973,781 @@ const cssTokens = {
 		return system;
 	}
 };
+//#endregion
+//#region ../dsgraph-adapters/dist/figma.js
+/**
+* A Figma file's variables and styles as DTCG 2025.10. The input is plain data, as the Figma plugin
+* reads it or as Figma's REST API returns variables (`fromFigmaRest`); this module has no imports,
+* so the plugin bundles it alone (`@dsgraph/adapters/figma`).
+*/
+/** Scopes of a number that is a length: a radius, a gap, a size, a stroke, a font size. */
+const LENGTH_SCOPES = /* @__PURE__ */ new Set([
+	"CORNER_RADIUS",
+	"WIDTH_HEIGHT",
+	"GAP",
+	"STROKE_FLOAT",
+	"EFFECT_FLOAT",
+	"FONT_SIZE",
+	"LINE_HEIGHT",
+	"LETTER_SPACING",
+	"PARAGRAPH_SPACING",
+	"PARAGRAPH_INDENT"
+]);
+/**
+* Scopes of a number that is an opacity. Figma keeps it in percent (0–100), in such a variable and
+* in a color composed of a color and an opacity; DTCG and CSS take a fraction.
+*/
+const OPACITY_SCOPES = /* @__PURE__ */ new Set(["OPACITY", "COLOR_OPACITY"]);
+const isOpacity = (scopes) => scopes.length > 0 && scopes.every((s) => OPACITY_SCOPES.has(s));
+/** Name words of a length, for numbers Figma offers everywhere (`ALL_SCOPES`). */
+const LENGTH_WORDS = /(^|[/._-])(space|spacing|size|sizes|radius|radii|width|height|gap|inset|padding|margin|gutter|offset|stroke|border|breakpoint|dimension|blur|spread|indent)([/._-]|$)/i;
+const WEIGHTS = [
+	[/thin|hairline/i, 100],
+	[/extra\s*light|ultra\s*light/i, 200],
+	[/light/i, 300],
+	[/semi\s*bold|demi\s*bold/i, 600],
+	[/extra\s*bold|ultra\s*bold/i, 800],
+	[/bold/i, 700],
+	[/black|heavy/i, 900],
+	[/medium/i, 500],
+	[/regular|normal|book|roman|plain/i, 400],
+	[/^\s*(italic|oblique)\s*$/i, 400]
+];
+/** A weight from a font style's name: `Semi Bold` 600, `Regular` 400. */
+const weightOf = (style) => WEIGHTS.find(([re]) => re.test(style))?.[1];
+/**
+* Figma's named curves: CSS's own, and the back curves as Figma draws them. Springs and `HOLD`
+* have no cubic Bézier.
+*/
+const CURVES = {
+	LINEAR: [
+		0,
+		0,
+		1,
+		1
+	],
+	EASE_IN: [
+		.42,
+		0,
+		1,
+		1
+	],
+	EASE_OUT: [
+		0,
+		0,
+		.58,
+		1
+	],
+	EASE_IN_AND_OUT: [
+		.42,
+		0,
+		.58,
+		1
+	],
+	EASE_IN_BACK: [
+		.3,
+		-.05,
+		.7,
+		-.5
+	],
+	EASE_OUT_BACK: [
+		.45,
+		1.45,
+		.8,
+		1
+	],
+	EASE_IN_AND_OUT_BACK: [
+		.7,
+		-.4,
+		.4,
+		1.4
+	]
+};
+function curve(e) {
+	if (e.bezier) return [
+		e.bezier.x1,
+		e.bezier.y1,
+		e.bezier.x2,
+		e.bezier.y2
+	].map((n) => round(n));
+	return CURVES[e.type];
+}
+const round = (n, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
+const hex2 = (v) => Math.round(v * 255).toString(16).padStart(2, "0");
+function color$1(c, opacity = 1) {
+	const alpha = round((c.a ?? 1) * opacity);
+	const out = {
+		colorSpace: "srgb",
+		components: [
+			round(c.r),
+			round(c.g),
+			round(c.b)
+		]
+	};
+	if (alpha < 1) out.alpha = alpha;
+	out.hex = `#${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}`;
+	return out;
+}
+const isAlias = (v) => typeof v === "object" && v !== null && "alias" in v;
+const isColor$1 = (v) => typeof v === "object" && v !== null && "r" in v;
+/** A token name in DTCG: `/` separates groups; `.`, `{`, `}` and a leading `$` are not allowed in names. */
+const pathOf = (name) => name.split("/").map((s) => s.trim().replace(/[{}]/g, "").replace(/\./g, "-").replace(/^\$/, "") || "_");
+const fileName = (s) => s.replace(/[\\/:*?"<>|]+/g, "-").trim() || "_";
+const refTo = (path) => `{${path.join(".")}}`;
+function setAt(doc, path, token) {
+	let node = doc;
+	for (const seg of path.slice(0, -1)) {
+		const next = node[seg];
+		if (next !== void 0 && (typeof next !== "object" || next === null || "$value" in next)) return false;
+		node[seg] = next ?? {};
+		node = node[seg];
+	}
+	const last = path[path.length - 1];
+	if (node[last] !== void 0) return false;
+	node[last] = token;
+	return true;
+}
+/** Token paths as keys, and every group above them: two sets of names overlap where a key of one is a key or a group of the other. */
+function keysOf(paths) {
+	const tokens = /* @__PURE__ */ new Set();
+	const groups = /* @__PURE__ */ new Set();
+	for (const p of paths) {
+		tokens.add(p.join("."));
+		for (let i = 1; i < p.length; i++) groups.add(p.slice(0, i).join("."));
+	}
+	return {
+		tokens,
+		groups
+	};
+}
+const overlap = (a, b) => [...a.tokens].some((k) => b.tokens.has(k) || b.groups.has(k)) || [...b.tokens].some((k) => a.groups.has(k));
+function figmaTokens(raw) {
+	const notes = [];
+	const byId = new Map(raw.variables.map((v) => [v.id, v]));
+	const collections = new Map(raw.collections.map((c) => [c.id, c]));
+	const own = (v) => {
+		const scopes = new Set(v.scopes);
+		const has = (set) => [...scopes].some((x) => set.has(x));
+		if (v.type === "COLOR") return {
+			t: "color",
+			sure: true
+		};
+		if (v.type === "EASING") return {
+			t: "cubicBezier",
+			sure: true
+		};
+		if (v.type === "TIMING") return {
+			t: "duration",
+			sure: true
+		};
+		if (v.type === "FLOAT") {
+			if (scopes.has("FONT_WEIGHT")) return {
+				t: "fontWeight",
+				sure: true
+			};
+			if (has(OPACITY_SCOPES)) return {
+				t: "number",
+				sure: true
+			};
+			if (has(LENGTH_SCOPES)) return {
+				t: "dimension",
+				sure: true
+			};
+			return {
+				t: LENGTH_WORDS.test(v.name) ? "dimension" : "number",
+				sure: false
+			};
+		}
+		if (v.type === "STRING") {
+			const literals = Object.values(v.valuesByMode).filter((x) => !isAlias(x));
+			const weights = literals.every((x) => typeof x === "string" && weightOf(x) !== void 0);
+			if ((scopes.has("FONT_STYLE") || scopes.has("FONT_WEIGHT")) && weights) return {
+				t: "fontWeight",
+				sure: true
+			};
+			if (scopes.has("FONT_FAMILY")) return {
+				t: "fontFamily",
+				sure: true
+			};
+			if (/weight/i.test(v.name) && literals.length && weights) return {
+				t: "fontWeight",
+				sure: false
+			};
+			return {
+				t: /font|family|typeface/i.test(v.name) ? "fontFamily" : null,
+				sure: false
+			};
+		}
+		return {
+			t: null,
+			sure: false
+		};
+	};
+	const referrers = /* @__PURE__ */ new Map();
+	for (const v of raw.variables) for (const x of Object.values(v.valuesByMode)) if (isAlias(x)) referrers.set(x.alias, [...referrers.get(x.alias) ?? [], v]);
+	/** The types the variables referring to `id` say for sure, through references that don't. */
+	const said = (id, seen) => (referrers.get(id) ?? []).flatMap((r) => {
+		if (seen.has(r.id)) return [];
+		seen.add(r.id);
+		const o = own(r);
+		return o.sure ? o.t ? [o.t] : [] : said(r.id, seen);
+	});
+	const types = /* @__PURE__ */ new Map();
+	const typeOf = (v, seen = /* @__PURE__ */ new Set()) => {
+		if (types.has(v.id)) return types.get(v.id);
+		const o = own(v);
+		let t = o.t;
+		if (!o.sure) {
+			const target = Object.values(v.valuesByMode).find(isAlias);
+			const local = target && byId.get(target.alias);
+			if (local && !seen.has(local.id)) t = typeOf(local, /* @__PURE__ */ new Set([...seen, v.id]));
+			else {
+				const fits = said(v.id, /* @__PURE__ */ new Set([v.id])).filter((x) => v.type === "FLOAT" ? [
+					"dimension",
+					"number",
+					"fontWeight"
+				].includes(x) : x === "fontFamily" || x === "fontWeight");
+				const fitting = v.type === "STRING" ? fits.filter((x) => x === "fontFamily" || Object.values(v.valuesByMode).every((y) => typeof y === "string" && weightOf(y) !== void 0)) : fits;
+				if (fitting.length) {
+					const count = /* @__PURE__ */ new Map();
+					for (const x of fitting) count.set(x, (count.get(x) ?? 0) + 1);
+					t = [...count].sort((a, b) => b[1] - a[1])[0][0];
+				}
+			}
+		}
+		types.set(v.id, t);
+		return t;
+	};
+	const literal = (type, value, scopes = []) => {
+		if (type === "color") return isColor$1(value) ? color$1(value) : void 0;
+		if (type === "cubicBezier") return typeof value === "object" && "easing" in value ? curve(value.easing) : void 0;
+		if (type === "duration") return typeof value === "number" ? {
+			value: round(value * 1e3, 3),
+			unit: "ms"
+		} : void 0;
+		if (typeof value === "number") return type === "dimension" ? {
+			value: round(value),
+			unit: "px"
+		} : round(type === "number" && isOpacity(scopes) ? value / 100 : value);
+		if (type === "fontFamily" && typeof value === "string") return value;
+		if (type === "fontWeight" && typeof value === "string") return weightOf(value);
+	};
+	/** The variables a collection writes: its own or, for an extended collection, all it has. */
+	const members = new Map(raw.collections.map((col) => {
+		if (!col.extends) return [col.id, raw.variables.filter((v) => v.collectionId === col.id)];
+		const has = col.extends.variables.flatMap((id) => byId.get(id) ?? []);
+		const missing = col.extends.variables.length - has.length;
+		if (missing) notes.push({
+			name: col.name,
+			message: `${missing} of the variables it inherits are not in the export; left out`
+		});
+		return [col.id, has];
+	}));
+	const memberIds = new Map([...members].map(([id, vars]) => [id, new Set(vars.map((v) => v.id))]));
+	/** A variable's value in a collection's mode: an extended collection's override, or its parent's value in the parent mode. */
+	const valueIn = (v, col, modeId, depth = 0) => {
+		if (!col.extends) return v.valuesByMode[modeId];
+		const own = col.extends.overrides[v.id]?.[modeId];
+		if (own !== void 0) return own;
+		const parentMode = col.modes.find((m) => m.id === modeId)?.parent;
+		const parent = collections.get(col.extends.parent);
+		if (!parentMode || depth > 16) return void 0;
+		if (!parent) return v.collectionId === col.extends.parent ? v.valuesByMode[parentMode] : void 0;
+		return valueIn(v, parent, parentMode, depth + 1);
+	};
+	const prefix = new Map(raw.collections.map((c) => [c.id, c.extends ? pathOf(c.name) : []]));
+	const pathIn = (col, v) => [...prefix.get(col.id), ...pathOf(v.name)];
+	const written = raw.collections.filter((c) => members.get(c.id).some((v) => typeOf(v)));
+	const styleKeys = keysOf([
+		...raw.styles.paint,
+		...raw.styles.text,
+		...raw.styles.effect,
+		...raw.styles.grid ?? []
+	].map((s) => ["styles", ...pathOf(s.name)]));
+	for (let pass = 0; pass < 4; pass++) {
+		const keys = written.map((col) => keysOf(members.get(col.id).filter((v) => typeOf(v)).map((v) => pathIn(col, v))));
+		const clash = /* @__PURE__ */ new Map();
+		const add = (col, other) => clash.set(col, [...clash.get(col) ?? [], other]);
+		written.forEach((a, i) => {
+			if (overlap(keys[i], styleKeys)) add(a, "styles");
+			for (let j = i + 1; j < written.length; j++) {
+				const b = written[j];
+				if (!overlap(keys[i], keys[j])) continue;
+				add(a, b.name);
+				add(b, a.name);
+			}
+		});
+		let moved = false;
+		for (const [col, others] of clash) {
+			if (prefix.get(col.id).length) continue;
+			prefix.set(col.id, pathOf(col.name));
+			moved = true;
+			notes.push({
+				name: col.name,
+				message: `its names overlap ${others.join(", ")}; its tokens are under ${pathOf(col.name).join(".")}`
+			});
+		}
+		if (!moved) break;
+	}
+	/** A reference to a variable where it is written, if it is: in its own collection, not an extension. */
+	const homePath = (id) => {
+		const v = byId.get(id);
+		const home = v && collections.get(v.collectionId);
+		return v && home && !home.extends && memberIds.get(home.id)?.has(id) ? pathIn(home, v) : void 0;
+	};
+	/** A variable's value in its collection's default mode, through references, for composed colors. */
+	const resolved = (id, seen = /* @__PURE__ */ new Set()) => {
+		const v = byId.get(id);
+		if (!v) return raw.external[id]?.value;
+		const col = collections.get(v.collectionId);
+		const x = v.valuesByMode[col?.defaultModeId ?? ""] ?? Object.values(v.valuesByMode)[0];
+		return isAlias(x) && !seen.has(x.alias) ? resolved(x.alias, /* @__PURE__ */ new Set([...seen, id])) : x;
+	};
+	const nameOf = (id) => byId.get(id)?.name ?? raw.external[id]?.name ?? id;
+	/** One mode's value: a reference to a variable of the file, or a literal (a library variable's value). */
+	const modeValue = (v, col, type, value, ext) => {
+		if (typeof value === "object" && "composed" in value) {
+			const { color: c, opacity: o } = value.composed;
+			const base = isAlias(c) ? resolved(c.alias) : c;
+			const percent = isAlias(o) ? resolved(o.alias) : o;
+			const alpha = typeof percent === "number" ? percent / 100 : void 0;
+			ext["com.figma.composedColor"] = {
+				color: isAlias(c) ? nameOf(c.alias) : null,
+				opacity: isAlias(o) ? nameOf(o.alias) : o
+			};
+			return isColor$1(base) && typeof alpha === "number" ? color$1(base, alpha) : void 0;
+		}
+		if (!isAlias(value)) {
+			const out = literal(type, value, v.scopes);
+			if (out === void 0 && type === "cubicBezier" && typeof value === "object" && "easing" in value) notes.push({
+				name: v.name,
+				message: `the ${value.easing.type.toLowerCase().replace(/_/g, " ")} curve has no cubic Bézier; left out`
+			});
+			return out;
+		}
+		const target = byId.get(value.alias);
+		if (target && col.extends && memberIds.get(col.id).has(target.id)) return refTo(pathIn(col, target));
+		const home = homePath(value.alias);
+		if (home) return refTo(home);
+		const lib = raw.external[value.alias] ?? (target ? {
+			name: target.name,
+			value: resolved(target.id),
+			scopes: target.scopes
+		} : void 0);
+		if (!lib || lib.value === void 0) {
+			notes.push({
+				name: v.name,
+				message: "refers to a variable that is neither in the file nor in a library it uses"
+			});
+			return;
+		}
+		ext["com.figma.alias"] = lib.name;
+		return isAlias(lib.value) ? void 0 : literal(type, lib.value, lib.scopes);
+	};
+	const files = {};
+	const single = {};
+	const resolver = {
+		version: "2025.10",
+		sets: {},
+		modifiers: {},
+		resolutionOrder: []
+	};
+	const order = resolver.resolutionOrder;
+	const layout = [];
+	let count = 0;
+	let skipped = 0;
+	const summary = {
+		collections: [],
+		styles: {}
+	};
+	for (const col of raw.collections) {
+		const vars = members.get(col.id);
+		if (!vars.length) continue;
+		const before = count;
+		const modes = col.modes;
+		const docs = new Map(modes.map((m) => [m.id, {}]));
+		for (const v of vars) {
+			const type = typeOf(v);
+			if (!type) {
+				if (!col.extends) {
+					skipped++;
+					notes.push({
+						name: v.name,
+						message: `${v.type.toLowerCase()} variables have no DTCG type; left out`
+					});
+				}
+				continue;
+			}
+			const path = pathIn(col, v);
+			const ext = { "com.figma.variableId": v.id };
+			if (v.scopes.length && !v.scopes.includes("ALL_SCOPES")) ext["com.figma.scopes"] = v.scopes;
+			if (v.codeSyntax && Object.keys(v.codeSyntax).length) ext["com.figma.codeSyntax"] = v.codeSyntax;
+			if (v.hiddenFromPublishing) ext["com.figma.hiddenFromPublishing"] = true;
+			const perMode = {};
+			for (const m of modes) {
+				const raw0 = valueIn(v, col, m.id);
+				if (raw0 === void 0) continue;
+				const value = modeValue(v, col, type, raw0, ext);
+				if (value === void 0) continue;
+				perMode[m.name] = value;
+				const token = {
+					$type: type,
+					$value: value
+				};
+				if (v.description) token.$description = v.description;
+				token.$extensions = ext;
+				if (!setAt(docs.get(m.id), path, token)) notes.push({
+					name: v.name,
+					message: "its name is taken by another token or group; left out"
+				});
+			}
+			const base = perMode[modes.find((m) => m.id === col.defaultModeId)?.name ?? ""] ?? Object.values(perMode)[0];
+			if (base === void 0) continue;
+			count++;
+			const token = {
+				$type: type,
+				$value: base
+			};
+			if (v.description) token.$description = v.description;
+			token.$extensions = modes.length > 1 ? {
+				...ext,
+				mode: perMode,
+				"com.figma.collection": col.name
+			} : ext;
+			if (!setAt(single, path, token)) notes.push({
+				name: v.name,
+				message: "another collection has a token or group with this name"
+			});
+		}
+		summary.collections.push({
+			name: col.name,
+			modes: modes.map((m) => m.name),
+			variables: count - before
+		});
+		const name = fileName(col.name);
+		if (modes.length === 1) {
+			files[`${name}.tokens.json`] = docs.get(modes[0].id);
+			resolver.sets[name] = { sources: [{ $ref: `${name}.tokens.json` }] };
+			order.push({ $ref: `#/sets/${name}` });
+			layout.push({
+				kind: "set",
+				name,
+				file: `${name}.tokens.json`
+			});
+		} else {
+			const contexts = {};
+			for (const m of modes) {
+				const f = `${name}/${fileName(m.name)}.tokens.json`;
+				files[f] = docs.get(m.id);
+				contexts[m.name] = [{ $ref: f }];
+			}
+			const def = modes.find((m) => m.id === col.defaultModeId)?.name ?? modes[0].name;
+			resolver.modifiers[name] = {
+				contexts,
+				default: def
+			};
+			order.push({ $ref: `#/modifiers/${name}` });
+			layout.push({
+				kind: "modifier",
+				name,
+				contexts: modes.map((m) => ({
+					name: m.name,
+					file: `${name}/${fileName(m.name)}.tokens.json`
+				})),
+				default: def
+			});
+		}
+	}
+	const styles = convertStyles(raw, (id, type) => {
+		const v = byId.get(id);
+		const path = homePath(id);
+		return v && path && typeOf(v) === type ? refTo(path) : void 0;
+	}, notes);
+	if (Object.keys(styles.doc).length) {
+		files["styles.tokens.json"] = styles.doc;
+		resolver.sets.styles = { sources: [{ $ref: "styles.tokens.json" }] };
+		order.push({ $ref: "#/sets/styles" });
+		layout.push({
+			kind: "set",
+			name: "styles",
+			file: "styles.tokens.json"
+		});
+		for (const [k, v] of Object.entries(styles.doc)) if (single[k] === void 0) single[k] = v;
+	}
+	if (!Object.keys(resolver.modifiers).length) delete resolver.modifiers;
+	files["tokens.resolver.json"] = resolver;
+	return {
+		files,
+		single,
+		layout,
+		notes,
+		stats: {
+			collections: raw.collections.length,
+			variables: count,
+			styles: styles.count,
+			skipped
+		},
+		summary: {
+			...summary,
+			styles: styles.byType
+		}
+	};
+}
+/**
+* Styles under `styles`: paint styles as colors and gradients, text styles as typography, effect
+* styles as shadows, grid styles as a group of their numbers (DTCG has no grid type).
+*/
+function convertStyles(raw, refOf, notes) {
+	const doc = {};
+	let count = 0;
+	const byType = {};
+	const ref = (id, type) => id ? refOf(id, type) : void 0;
+	const put = (name, token, id, description, kind = token.$type) => {
+		if (description) token.$description = description;
+		token.$extensions = { "com.figma.styleId": id };
+		if (setAt(doc, ["styles", ...pathOf(name)], token)) {
+			count++;
+			byType[kind] = (byType[kind] ?? 0) + 1;
+		} else notes.push({
+			name,
+			message: "its name is taken by another style; left out"
+		});
+	};
+	for (const s of raw.styles.paint) {
+		const visible = s.paints;
+		if (visible.length !== 1) {
+			notes.push({
+				name: s.name,
+				message: "a style of several paints has no DTCG type; left out"
+			});
+			continue;
+		}
+		const p = visible[0];
+		if (p.type === "SOLID" && p.color) {
+			const value = (p.opacity ?? 1) === 1 ? ref(p.variable, "color") : void 0;
+			put(s.name, {
+				$type: "color",
+				$value: value ?? color$1(p.color, p.opacity ?? 1)
+			}, s.id, s.description);
+		} else if (p.type.startsWith("GRADIENT") && p.stops) put(s.name, {
+			$type: "gradient",
+			$value: p.stops.map((x) => ({
+				color: ref(x.variable, "color") ?? color$1(x.color),
+				position: round(x.position)
+			}))
+		}, s.id, s.description);
+		else notes.push({
+			name: s.name,
+			message: `${p.type.toLowerCase()} paints have no DTCG type; left out`
+		});
+	}
+	for (const s of raw.styles.text) put(s.name, {
+		$type: "typography",
+		$value: typography$1(s, ref)
+	}, s.id, s.description);
+	for (const s of raw.styles.effect) {
+		const shadows = s.effects.filter((e) => (e.type === "DROP_SHADOW" || e.type === "INNER_SHADOW") && e.visible !== false);
+		if (!shadows.length) {
+			notes.push({
+				name: s.name,
+				message: "blur effects have no DTCG type; left out"
+			});
+			continue;
+		}
+		put(s.name, {
+			$type: "shadow",
+			$value: shadows.map((e) => ({
+				color: color$1(e.color ?? {
+					r: 0,
+					g: 0,
+					b: 0,
+					a: .25
+				}),
+				offsetX: {
+					value: round(e.offset?.x ?? 0),
+					unit: "px"
+				},
+				offsetY: {
+					value: round(e.offset?.y ?? 0),
+					unit: "px"
+				},
+				blur: {
+					value: round(e.radius ?? 0),
+					unit: "px"
+				},
+				spread: {
+					value: round(e.spread ?? 0),
+					unit: "px"
+				},
+				inset: e.type === "INNER_SHADOW"
+			}))
+		}, s.id, s.description);
+	}
+	for (const s of raw.styles.grid ?? []) {
+		const group = {};
+		for (const g of s.grids.filter((x) => x.visible !== false)) {
+			const word = g.pattern === "COLUMNS" ? "columns" : g.pattern === "ROWS" ? "rows" : "grid";
+			let key = word;
+			for (let i = 2; group[key]; i++) key = `${word}-${i}`;
+			const b = g.bound ?? {};
+			const px = (field, n) => n === void 0 || !Number.isFinite(n) ? void 0 : {
+				$type: "dimension",
+				$value: ref(b[field], "dimension") ?? {
+					value: round(n),
+					unit: "px"
+				}
+			};
+			const fields = g.pattern === "GRID" ? { size: px("sectionSize", g.sectionSize) } : {
+				count: g.count !== void 0 && Number.isFinite(g.count) ? {
+					$type: "number",
+					$value: ref(b.count, "number") ?? g.count
+				} : void 0,
+				gutter: px("gutterSize", g.gutterSize),
+				offset: px("offset", g.offset),
+				size: g.alignment === "STRETCH" ? void 0 : px("sectionSize", g.sectionSize)
+			};
+			const tokens = Object.fromEntries(Object.entries(fields).filter(([, t]) => t));
+			if (Object.keys(tokens).length) group[key] = tokens;
+		}
+		if (!Object.keys(group).length) {
+			notes.push({
+				name: s.name,
+				message: "a grid style with no visible grids; left out"
+			});
+			continue;
+		}
+		put(s.name, group, s.id, s.description, "grid");
+	}
+	return {
+		doc,
+		count,
+		byType
+	};
+}
+/**
+* A text style as DTCG typography. Line height becomes a multiple of the size (`AUTO` is CSS
+* `normal`, about 1.2), letter spacing a length (a percentage is of the size); fields bound to
+* variables of the right type are references.
+*/
+function typography$1(s, ref) {
+	const size = s.fontSize;
+	const weight = weightOf(s.fontStyle) ?? 400;
+	const lineHeight = s.lineHeight.unit === "PIXELS" && s.lineHeight.value ? round(s.lineHeight.value / size) : s.lineHeight.unit === "PERCENT" && s.lineHeight.value ? round(s.lineHeight.value / 100) : 1.2;
+	const tracking = s.letterSpacing.unit === "PERCENT" ? s.letterSpacing.value / 100 * size : s.letterSpacing.value;
+	const b = s.bound ?? {};
+	return {
+		fontFamily: ref(b.fontFamily, "fontFamily") ?? s.fontFamily,
+		fontSize: ref(b.fontSize, "dimension") ?? {
+			value: round(size),
+			unit: "px"
+		},
+		fontWeight: ref(b.fontWeight, "fontWeight") ?? ref(b.fontStyle, "fontWeight") ?? weight,
+		letterSpacing: ref(b.letterSpacing, "dimension") ?? {
+			value: round(tracking),
+			unit: "px"
+		},
+		lineHeight
+	};
+}
+/**
+* A value as Figma's REST API writes it: an alias is `{ type: 'VARIABLE_ALIAS', id }`; a color
+* composed of a color and an opacity is `{ color, opacity }` or, as older builds wrote it, a
+* `COMPOSE_COLOR` expression of the two.
+*/
+function restValue(v) {
+	if (typeof v !== "object" || v === null) return v;
+	const o = v;
+	if (o.type === "VARIABLE_ALIAS" && typeof o.id === "string") return { alias: o.id };
+	const parts = composedParts(o);
+	if (parts) return { composed: {
+		color: restValue(parts[0]),
+		opacity: restValue(parts[1])
+	} };
+	return v;
+}
+/** The color and the opacity of a composed color, in either of the shapes Figma has given it. */
+function composedParts(o) {
+	if ("color" in o && "opacity" in o && !("r" in o)) return [o.color, o.opacity];
+	if (o.type === "VARIABLE_EXPRESSION" && o.expressionFunction === "COMPOSE_COLOR") {
+		const unwrap = (x) => x && typeof x === "object" && "value" in x && !("r" in x) && x.type !== "VARIABLE_ALIAS" ? unwrap(x.value) : x;
+		const [color, opacity] = (o.expressionArguments ?? []).map(unwrap);
+		return color !== void 0 && opacity !== void 0 ? [color, opacity] : void 0;
+	}
+}
+/**
+* The response of Figma's REST API for a file's variables (`GET /v1/files/:key/variables/local`)
+* as the plugin reads a file: local variables, and the library ones they use as their values.
+* Styles are not in that response.
+*/
+function fromFigmaRest(response, name = "Figma") {
+	const meta = response?.meta;
+	const vars = meta?.variables;
+	const cols = meta?.variableCollections;
+	if (!vars || !cols || typeof vars !== "object" || typeof cols !== "object") return void 0;
+	const collections = Object.values(cols).filter((c) => !c.remote).map((c) => {
+		const out = {
+			id: String(c.id),
+			name: String(c.name),
+			modes: (c.modes ?? []).map((m) => ({
+				id: m.modeId,
+				name: m.name,
+				...m.parentModeId ? { parent: m.parentModeId } : {}
+			})),
+			defaultModeId: String(c.defaultModeId)
+		};
+		if (c.isExtension && typeof c.parentVariableCollectionId === "string") {
+			const overrides = c.variableOverrides ?? {};
+			out.extends = {
+				parent: c.parentVariableCollectionId,
+				variables: (c.variableIds ?? []).map(String),
+				overrides: Object.fromEntries(Object.entries(overrides).map(([id, byMode]) => [id, Object.fromEntries(Object.entries(byMode).map(([m, x]) => [m, restValue(x)]))]))
+			};
+		}
+		return out;
+	});
+	const local = new Set(collections.map((c) => c.id));
+	const inherited = new Set(collections.flatMap((c) => c.extends?.variables ?? []));
+	const variables = [];
+	const external = {};
+	for (const v of Object.values(vars)) {
+		const valuesByMode = Object.fromEntries(Object.entries(v.valuesByMode ?? {}).map(([m, x]) => [m, restValue(x)]));
+		const base = {
+			name: String(v.name),
+			type: v.resolvedType,
+			scopes: v.scopes ?? []
+		};
+		if (local.has(String(v.variableCollectionId)) || inherited.has(String(v.id))) {
+			const out = {
+				...base,
+				id: String(v.id),
+				collectionId: String(v.variableCollectionId),
+				valuesByMode
+			};
+			if (v.description) out.description = String(v.description);
+			if (v.codeSyntax && Object.keys(v.codeSyntax).length) out.codeSyntax = v.codeSyntax;
+			if (v.hiddenFromPublishing) out.hiddenFromPublishing = true;
+			variables.push(out);
+		} else {
+			const col = cols[String(v.variableCollectionId)];
+			const value = valuesByMode[String(col?.defaultModeId)] ?? Object.values(valuesByMode)[0];
+			if (value !== void 0) external[String(v.id)] = {
+				...base,
+				value
+			};
+		}
+	}
+	return {
+		file: { name },
+		collections,
+		variables,
+		external,
+		styles: {
+			paint: [],
+			text: [],
+			effect: []
+		}
+	};
+}
 //#endregion
 //#region ../dsgraph-adapters/dist/json-values.js
 /** Types of token-set and value/type JSON → DTCG types. Others keep their own name. */
@@ -37182,6 +38124,76 @@ function convertValue(sourceType, raw, path, c) {
 const groupType = (sourceType) => {
 	const t = mapType(sourceType);
 	return t === "lineHeight" ? void 0 : t;
+};
+//#endregion
+//#region ../dsgraph-adapters/dist/tokens-figma.js
+/** A response of Figma's REST API for variables names its collections; nothing else does. */
+const MARKER$1 = /"variableCollections"\s*:/;
+async function responses(source, config) {
+	const exclude = excludeFor(config, "tokens");
+	const files = (await source.list(config.tokens?.include ?? ["**/*.json"])).filter((p) => /\.json$/i.test(p) && !matchGlob(p, exclude) && !NOT_TOKENS.test(p)).sort().slice(0, 2e3);
+	await prefetch(source, files);
+	const out = [];
+	for (const file of files) {
+		const text = await source.readText(file);
+		if (!MARKER$1.test(text)) continue;
+		try {
+			const tree = parseJsonLenient(text).value;
+			if (fromFigmaRest(tree)) out.push({
+				file,
+				tree
+			});
+		} catch {}
+	}
+	return out;
+}
+/**
+* Figma variables as Figma's REST API returns them (`GET /v1/files/:key/variables/local`, saved as
+* a `.json` file): each collection with one mode a set, each with several a modifier, its default
+* mode the default; references and library values as `figmaTokens` writes them.
+*/
+const figmaVariables = {
+	name: "figma-variables",
+	priority: "first",
+	async detect(source, config) {
+		return (await responses(source, config)).map((r) => r.file);
+	},
+	async load(source, files, config, diag) {
+		const wanted = new Set(files);
+		const system = {
+			sets: /* @__PURE__ */ new Map(),
+			modifiers: /* @__PURE__ */ new Map(),
+			order: [],
+			synthetic: false,
+			kind: "dtcg"
+		};
+		for (const { file, tree } of await responses(source, config)) {
+			if (!wanted.has(file)) continue;
+			const out = figmaTokens(fromFigmaRest(tree, file));
+			const doc = (f) => [{
+				file: `${file}#${f}`,
+				tree: out.files[f]
+			}];
+			for (const part of out.layout) if (part.kind === "set") {
+				system.sets.set(part.name, doc(part.file));
+				system.order.push({
+					kind: "set",
+					name: part.name
+				});
+			} else {
+				system.modifiers.set(part.name, {
+					contexts: new Map(part.contexts.map((c) => [c.name, doc(c.file)])),
+					default: part.default
+				});
+				system.order.push({
+					kind: "modifier",
+					name: part.name
+				});
+			}
+			for (const n of out.notes) diag.info("figma/left-out", `${n.name}: ${n.message}`, { file });
+		}
+		return system;
+	}
 };
 //#endregion
 //#region ../dsgraph-adapters/dist/tokens-json.js
@@ -38051,7 +39063,7 @@ const ICON = {
 	info: "•"
 };
 /** `file:line` when a finding points into code, the file alone otherwise. */
-const where = (loc) => `${loc.file}${loc.line ? `:${loc.line}` : ""}`;
+const where$1 = (loc) => `${loc.file}${loc.line ? `:${loc.line}` : ""}`;
 const QUOTED = /"[^"]*"/g;
 /** What differs between repeated messages: quoted values and numbers (`steps 0 and 1`). */
 const VARIABLE = /"[^"]*"|\b\d+(?:\.\d+)?\b/g;
@@ -38130,19 +39142,19 @@ function formatFindings(findings, opts = {}) {
 	const summary = summaryOf(findings);
 	const head = opts.heading === false ? "" : `## dsgraph check — ${summary}\n\n`;
 	if (md) {
-		if (!grouped) return `${head}| | Rule | Finding | File |\n|---|---|---|---|\n${findings.map((f) => `| ${ICON[f.severity]} ${f.severity} | \`${f.rule}\` | ${cell(quotedAsCode(f.message))}${formatWhen(f.when)} | ${f.loc?.file ? `\`${where(f.loc)}\`` : ""} |`).join("\n")}\n`;
+		if (!grouped) return `${head}| | Rule | Finding | File |\n|---|---|---|---|\n${findings.map((f) => `| ${ICON[f.severity]} ${f.severity} | \`${f.rule}\` | ${cell(quotedAsCode(f.message))}${formatWhen(f.when)} | ${f.loc?.file ? `\`${where$1(f.loc)}\`` : ""} |`).join("\n")}\n`;
 		const groups = groupFindings(findings);
 		const max = opts.maxListed ?? 50;
-		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(quotedAsCode(listed(g)))}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.findings.length === 1 && g.findings[0].loc?.file ? `\`${where(g.findings[0].loc)}\`` : g.file ? `\`${g.file}\`` : ""} |`);
+		const rows = groups.map((g) => `| ${ICON[g.severity]} ${g.severity} | \`${g.rule}\` | ${g.findings.length} | ${cell(quotedAsCode(listed(g)))}${g.findings.length === 1 ? formatWhen(g.findings[0].when) : ""} | ${g.findings.length === 1 && g.findings[0].loc?.file ? `\`${where$1(g.findings[0].loc)}\`` : g.file ? `\`${g.file}\`` : ""} |`);
 		const details = groups.filter((g) => g.findings.length > 1).map((g) => {
-			const items = g.findings.slice(0, max).map((f) => `- ${cell(quotedAsCode(f.message))}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : f.loc?.file ? ` — \`${f.loc.file}\`` : ""}`);
+			const items = g.findings.slice(0, max).map((f) => `- ${cell(quotedAsCode(f.message))}${formatWhen(f.when)}${f.loc?.line ? ` — \`${where$1(f.loc)}\`` : f.nodes[0] ? ` — \`${f.nodes[0]}\`` : f.loc?.file ? ` — \`${f.loc.file}\`` : ""}`);
 			if (g.findings.length > max) items.push(`- … and ${g.findings.length - max} more`);
 			return `<details><summary>${ICON[g.severity]} <code>${g.rule}</code> — ${g.findings.length} × ${quotedAsHtml(listed(g))}</summary>\n\n${items.join("\n")}\n\n</details>`;
 		});
 		return `${head}| | Rule | Count | Finding | File |\n|---|---|---|---|---|\n${rows.join("\n")}\n${details.length ? `\n${details.join("\n\n")}\n` : ""}`;
 	}
 	const line = (severity, rule, text) => `${ICON[severity]} ${severity.padEnd(7)} ${rule.padEnd(30)} ${text}`;
-	if (!grouped) return `dsgraph check — ${summary}\n\n${findings.map((f) => line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${where(f.loc)})` : ""}`)).join("\n")}\n`;
+	if (!grouped) return `dsgraph check — ${summary}\n\n${findings.map((f) => line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${where$1(f.loc)})` : ""}`)).join("\n")}\n`;
 	const examples = opts.examples ?? 3;
 	const indent = " ".repeat(41);
 	const lines = [];
@@ -38151,7 +39163,7 @@ function formatFindings(findings, opts = {}) {
 		const file = g.file ? `  (${g.file})` : "";
 		if (n === 1) {
 			const f = g.findings[0];
-			lines.push(line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${where(f.loc)})` : ""}`));
+			lines.push(line(f.severity, f.rule, `${f.message}${formatWhen(f.when)}${f.loc?.file ? `  (${where$1(f.loc)})` : ""}`));
 			continue;
 		}
 		lines.push(line(g.severity, g.rule, `${n}× ${g.pattern}${file}`));
@@ -38297,7 +39309,12 @@ const hardcodedColor = {
 		const skip = excepted(options);
 		const memo = /* @__PURE__ */ new Map();
 		const palette = paletteLiterals(code, vars);
-		for (const l of [...code.literals, ...palette]) {
+		const foreign = foreignLiterals(code, vars);
+		for (const l of [
+			...code.literals,
+			...palette,
+			...foreign.keys()
+		]) {
 			if (l.type !== "color" || skip(l)) continue;
 			const { states, components } = styleContext(l, knowledge);
 			const key = [
@@ -38310,7 +39327,7 @@ const hardcodedColor = {
 			const near = memo.get(key);
 			if (!near) continue;
 			report({
-				message: palette.includes(l) ? `"${l.source}" is Tailwind's own color, not one of the system's; use "${classFor(l.source, near.token)}" (token "${near.token.id}"${near.exact ? "" : `, ΔE ${near.distance}`})` : l.source ? near.exact ? `"${l.source}" writes a color by hand; use "${classFor(l.source, near.token)}" (token "${near.token.id}")` : `"${l.source}" is not in the palette; closest is "${classFor(l.source, near.token)}" (token "${near.token.id}", ΔE ${near.distance})` : near.exact ? `Color "${l.text}" in ${l.property} is written by hand; use "${near.token.id}"` : `Color "${l.text}" in ${l.property} is not in the palette; closest is "${near.token.id}" (ΔE ${near.distance})`,
+				message: foreign.has(l) ? near.exact ? `"${l.source}" is ${l.text} in the code's own variables (${where(foreign.get(l))}), not a token; use "${near.token.id}"` : `"${l.source}" is ${l.text} in the code's own variables (${where(foreign.get(l))}); no token has it, closest is "${near.token.id}" (ΔE ${near.distance})` : palette.includes(l) ? `"${l.source}" is Tailwind's own color, not one of the system's; use "${classFor(l.source, near.token)}" (token "${near.token.id}"${near.exact ? "" : `, ΔE ${near.distance}`})` : l.source ? near.exact ? `"${l.source}" writes a color by hand; use "${classFor(l.source, near.token)}" (token "${near.token.id}")` : `"${l.source}" is not in the palette; closest is "${classFor(l.source, near.token)}" (token "${near.token.id}", ΔE ${near.distance})` : near.exact ? `Color "${l.text}" in ${l.property} is written by hand; use "${near.token.id}"` : `Color "${l.text}" in ${l.property} is not in the palette; closest is "${near.token.id}" (ΔE ${near.distance})`,
 				nodes: [near.token.id],
 				evidence: {
 					value: l.text,
@@ -38318,10 +39335,11 @@ const hardcodedColor = {
 					selector: l.selector,
 					source: l.source,
 					token: near.token.id,
-					replacement: l.source ? classFor(l.source, near.token) : near.token.id,
+					replacement: l.source && !foreign.has(l) ? classFor(l.source, near.token) : near.token.id,
 					exact: near.exact,
 					deltaE: near.distance,
-					...palette.includes(l) ? { builtin: true } : {}
+					...palette.includes(l) ? { builtin: true } : {},
+					...foreign.has(l) ? foreignEvidence(foreign.get(l)) : {}
 				},
 				loc: locOf(l)
 			});
@@ -38351,15 +39369,51 @@ function paletteLiterals(code, vars) {
 	}
 	return out;
 }
+/**
+* Uses of variables the code defines itself (a prototype's library, `--sp-accent: #2563eb`) that
+* lead to a value written by hand, not to a token of the system: values the system should name.
+* A chain that passes through a token of the system is the system's.
+*/
+function foreignLiterals(code, vars) {
+	const out = /* @__PURE__ */ new Map();
+	for (const u of code.uses) {
+		const r = u.resolved;
+		if (!r || vars?.tokenOfUse(u) || r.via.some((name) => vars?.token(name))) continue;
+		const l = {
+			file: u.file,
+			line: u.line,
+			column: u.column,
+			property: u.property,
+			text: r.text,
+			source: u.text ?? `var(${u.name})`,
+			type: r.type,
+			value: r.value
+		};
+		if (u.selector) l.selector = u.selector;
+		out.set(l, {
+			variable: u.name,
+			via: r.via,
+			at: r.at
+		});
+	}
+	return out;
+}
+const where = (f) => `${f.at.file}:${f.at.line}`;
+const foreignEvidence = (f) => ({
+	variable: f.variable,
+	via: f.via,
+	definedAt: where(f)
+});
 const offScale = {
 	id: "style/off-scale",
 	description: "A spacing, radius or font size in a style is written by hand: on the scale (use the token) or off it.",
 	defaultSeverity: "warning",
-	run({ graph, code, options, knowledge, report }) {
+	run({ graph, code, vars, options, knowledge, report }) {
 		if (!code || graph.tokens({ type: "dimension" }).length === 0) return;
 		const skip = excepted(options);
 		const scales = /* @__PURE__ */ new Map();
-		for (const l of code.literals) {
+		const foreign = foreignLiterals(code, vars);
+		for (const l of [...code.literals, ...foreign.keys()]) {
 			if (l.type !== "dimension" || skip(l)) continue;
 			const scale = scaleOf(graph, l.property, scales);
 			const near = nearestIn(graph, l, knowledge, new Set(scale.map((t) => t.id)));
@@ -38367,7 +39421,7 @@ const offScale = {
 			if (!near.exact && /radius$/i.test(l.property) && pxOf(l.value) >= 100) continue;
 			const px = near.value;
 			report({
-				message: l.source ? near.exact ? `"${l.source}" is on the scale; use "${classFor(l.source, near.token)}" (token "${near.token.id}")` : `"${l.source}" is off the scale; closest is "${classFor(l.source, near.token)}" (token "${near.token.id}", ${px.value}${px.unit})` : near.exact ? `"${l.text}" in ${l.property} is on the scale; use "${near.token.id}"` : `"${l.text}" in ${l.property} is off the scale; closest is "${near.token.id}" (${px.value}${px.unit})`,
+				message: foreign.has(l) ? near.exact ? `"${l.source}" is ${l.text} in the code's own variables (${where(foreign.get(l))}), on the scale; use "${near.token.id}"` : `"${l.source}" is ${l.text} in the code's own variables (${where(foreign.get(l))}), off the scale; closest is "${near.token.id}" (${px.value}${px.unit})` : l.source ? near.exact ? `"${l.source}" is on the scale; use "${classFor(l.source, near.token)}" (token "${near.token.id}")` : `"${l.source}" is off the scale; closest is "${classFor(l.source, near.token)}" (token "${near.token.id}", ${px.value}${px.unit})` : near.exact ? `"${l.text}" in ${l.property} is on the scale; use "${near.token.id}"` : `"${l.text}" in ${l.property} is off the scale; closest is "${near.token.id}" (${px.value}${px.unit})`,
 				nodes: [near.token.id],
 				evidence: {
 					value: l.text,
@@ -38375,9 +39429,10 @@ const offScale = {
 					selector: l.selector,
 					source: l.source,
 					token: near.token.id,
-					replacement: l.source ? classFor(l.source, near.token) : near.token.id,
+					replacement: l.source && !foreign.has(l) ? classFor(l.source, near.token) : near.token.id,
 					exact: near.exact,
-					distance: near.distance
+					distance: near.distance,
+					...foreign.has(l) ? foreignEvidence(foreign.get(l)) : {}
 				},
 				loc: locOf(l),
 				...near.exact ? { severity: "info" } : {}
@@ -39337,7 +40392,11 @@ function remoteSource(spec, opts = {}) {
 async function loadGraph(spec, config, cwd) {
 	const { source, config: cfg, snapshot } = await toSource(spec, config, cwd);
 	if (snapshot) return DsGraph.from(snapshot);
-	return DsGraph.from(await scan(source, cfg, { adapters: [jsonTokens, cssTokens] }));
+	return DsGraph.from(await scan(source, cfg, { adapters: [
+		figmaVariables,
+		jsonTokens,
+		cssTokens
+	] }));
 }
 async function toSource(spec, config, cwd) {
 	const remote = parseRemoteSpec(spec);
